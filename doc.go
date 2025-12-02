@@ -69,4 +69,4 @@
 //   - ClaudeSDKClient: High-level client API
 //   - Message types: UserMessage, AssistantMessage, SystemMessage, ResultMessage
 //   - Content blocks: TextBlock, ThinkingBlock, ToolUseBlock, ToolResultBlock
-package claude
+package claudeagent
