@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 const (
@@ -43,14 +44,13 @@ type SubprocessTransport struct {
 	ready         bool
 	exitError     error
 	maxBufferSize int
-	tempFiles     []string
 
 	mu     sync.Mutex
 	closed bool
 }
 
 // NewSubprocessTransport creates a new SubprocessTransport.
-// If prompt is empty, streaming mode is enabled.
+// Always uses streaming mode internally (matching TypeScript/Python SDK).
 func NewSubprocessTransport(prompt string, options ClaudeAgentOptions) *SubprocessTransport {
 	maxBufferSize := defaultMaxBufferSize
 	if options.MaxBufferSize != nil {
@@ -59,7 +59,7 @@ func NewSubprocessTransport(prompt string, options ClaudeAgentOptions) *Subproce
 
 	return &SubprocessTransport{
 		options:       options,
-		isStreaming:   prompt == "",
+		isStreaming:   true, // Always streaming mode
 		prompt:        prompt,
 		maxBufferSize: maxBufferSize,
 	}
@@ -163,6 +163,12 @@ func (t *SubprocessTransport) buildSettingsValue() (string, error) {
 	return string(data), nil
 }
 
+// formatBudget formats a float64 budget value removing trailing zeros.
+func formatBudget(v float64) string {
+	s := strconv.FormatFloat(v, 'f', -1, 64)
+	return s
+}
+
 // buildCommand builds the CLI command with arguments.
 func (t *SubprocessTransport) buildCommand() ([]string, error) {
 	cliPath, err := t.findCLI()
@@ -183,6 +189,21 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		}
 	}
 
+	// Handle tools option (base set of tools)
+	if t.options.Tools != nil {
+		switch tools := t.options.Tools.(type) {
+		case []string:
+			if len(tools) == 0 {
+				cmd = append(cmd, "--tools", "")
+			} else {
+				cmd = append(cmd, "--tools", strings.Join(tools, ","))
+			}
+		case *ToolsPreset:
+			// 'claude_code' preset maps to 'default'
+			cmd = append(cmd, "--tools", "default")
+		}
+	}
+
 	// Allowed tools
 	if len(t.options.AllowedTools) > 0 {
 		cmd = append(cmd, "--allowedTools", strings.Join(t.options.AllowedTools, ","))
@@ -193,9 +214,9 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		cmd = append(cmd, "--max-turns", strconv.Itoa(*t.options.MaxTurns))
 	}
 
-	// Max budget
+	// Max budget (formatted without trailing zeros)
 	if t.options.MaxBudgetUSD != nil {
-		cmd = append(cmd, "--max-budget-usd", fmt.Sprintf("%f", *t.options.MaxBudgetUSD))
+		cmd = append(cmd, "--max-budget-usd", formatBudget(*t.options.MaxBudgetUSD))
 	}
 
 	// Disallowed tools
@@ -211,6 +232,15 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 	// Fallback model
 	if t.options.FallbackModel != "" {
 		cmd = append(cmd, "--fallback-model", t.options.FallbackModel)
+	}
+
+	// Betas
+	if len(t.options.Betas) > 0 {
+		betaStrs := make([]string, len(t.options.Betas))
+		for i, b := range t.options.Betas {
+			betaStrs[i] = string(b)
+		}
+		cmd = append(cmd, "--betas", strings.Join(betaStrs, ","))
 	}
 
 	// Permission prompt tool name
@@ -247,14 +277,29 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		cmd = append(cmd, "--add-dir", dir)
 	}
 
-	// MCP servers
+	// MCP servers (strip SDK server instances before passing to CLI)
 	if len(t.options.McpServers) > 0 {
-		mcpConfig := map[string]any{"mcpServers": t.options.McpServers}
-		data, err := json.Marshal(mcpConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal MCP config: %w", err)
+		serversForCLI := make(map[string]any)
+		for name, config := range t.options.McpServers {
+			if config.Type == McpServerTypeSDK {
+				// For SDK servers, pass everything except what can't be serialized
+				sdkConfig := map[string]any{
+					"type": string(config.Type),
+					"name": config.Name,
+				}
+				serversForCLI[name] = sdkConfig
+			} else {
+				serversForCLI[name] = config
+			}
 		}
-		cmd = append(cmd, "--mcp-config", string(data))
+		if len(serversForCLI) > 0 {
+			mcpConfig := map[string]any{"mcpServers": serversForCLI}
+			data, err := json.Marshal(mcpConfig)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal MCP config: %w", err)
+			}
+			cmd = append(cmd, "--mcp-config", string(data))
+		}
 	} else if t.options.McpServersPath != "" {
 		cmd = append(cmd, "--mcp-config", t.options.McpServersPath)
 	}
@@ -269,14 +314,7 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		cmd = append(cmd, "--fork-session")
 	}
 
-	// Agents
-	if len(t.options.Agents) > 0 {
-		data, err := json.Marshal(t.options.Agents)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal agents: %w", err)
-		}
-		cmd = append(cmd, "--agents", string(data))
-	}
+	// Agents are sent via initialize request, not CLI flag
 
 	// Setting sources
 	if len(t.options.SettingSources) > 0 {
@@ -305,9 +343,30 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		}
 	}
 
-	// Max thinking tokens
-	if t.options.MaxThinkingTokens != nil {
-		cmd = append(cmd, "--max-thinking-tokens", strconv.Itoa(*t.options.MaxThinkingTokens))
+	// Resolve thinking config → --max-thinking-tokens
+	// `Thinking` takes precedence over the deprecated `MaxThinkingTokens`
+	resolvedMaxThinkingTokens := t.options.MaxThinkingTokens
+	if t.options.Thinking != nil {
+		switch tc := t.options.Thinking.(type) {
+		case ThinkingConfigAdaptive:
+			if resolvedMaxThinkingTokens == nil {
+				v := 32000
+				resolvedMaxThinkingTokens = &v
+			}
+		case ThinkingConfigEnabled:
+			resolvedMaxThinkingTokens = &tc.BudgetTokens
+		case ThinkingConfigDisabled:
+			v := 0
+			resolvedMaxThinkingTokens = &v
+		}
+	}
+	if resolvedMaxThinkingTokens != nil {
+		cmd = append(cmd, "--max-thinking-tokens", strconv.Itoa(*resolvedMaxThinkingTokens))
+	}
+
+	// Effort
+	if t.options.Effort != nil {
+		cmd = append(cmd, "--effort", *t.options.Effort)
 	}
 
 	// Output format (JSON schema)
@@ -323,35 +382,8 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		}
 	}
 
-	// Add prompt handling based on mode (must come after all flags)
-	if t.isStreaming {
-		cmd = append(cmd, "--input-format", "stream-json")
-	} else {
-		cmd = append(cmd, "--print", "--", t.prompt)
-	}
-
-	// Check command length and use temp file if needed
-	cmdStr := strings.Join(cmd, " ")
-	if len(cmdStr) > cmdLengthLimit && len(t.options.Agents) > 0 {
-		// Find --agents and move value to temp file
-		for i, arg := range cmd {
-			if arg == "--agents" && i+1 < len(cmd) {
-				agentsJSON := cmd[i+1]
-				tmpFile, err := os.CreateTemp("", "claude-agents-*.json")
-				if err != nil {
-					return nil, fmt.Errorf("failed to create temp file: %w", err)
-				}
-				if _, err := tmpFile.WriteString(agentsJSON); err != nil {
-					tmpFile.Close()
-					return nil, fmt.Errorf("failed to write temp file: %w", err)
-				}
-				tmpFile.Close()
-				t.tempFiles = append(t.tempFiles, tmpFile.Name())
-				cmd[i+1] = "@" + tmpFile.Name()
-				break
-			}
-		}
-	}
+	// Always use streaming mode with stdin (matching TypeScript/Python SDK)
+	cmd = append(cmd, "--input-format", "stream-json")
 
 	return cmd, nil
 }
@@ -382,6 +414,12 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 	}
 	env = append(env, "CLAUDE_CODE_ENTRYPOINT=sdk-go")
 	env = append(env, "CLAUDE_AGENT_SDK_VERSION="+sdkVersion)
+
+	// Enable file checkpointing if requested
+	if t.options.EnableFileCheckpointing {
+		env = append(env, "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true")
+	}
+
 	if t.options.Cwd != "" {
 		env = append(env, "PWD="+t.options.Cwd)
 	}
@@ -424,12 +462,6 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 			}
 		}
 		return NewCLIConnectionError("failed to start Claude Code", err)
-	}
-
-	// For non-streaming mode, close stdin immediately
-	if !t.isStreaming {
-		t.stdin.Close()
-		t.stdin = nil
 	}
 
 	t.ready = true
@@ -570,12 +602,6 @@ func (t *SubprocessTransport) Close() error {
 	t.closed = true
 	t.ready = false
 
-	// Clean up temp files
-	for _, f := range t.tempFiles {
-		os.Remove(f)
-	}
-	t.tempFiles = nil
-
 	// Close stdin
 	if t.stdin != nil {
 		t.stdin.Close()
@@ -588,9 +614,9 @@ func (t *SubprocessTransport) Close() error {
 		t.stderr = nil
 	}
 
-	// Terminate process
+	// Terminate process with SIGTERM (graceful shutdown)
 	if t.cmd != nil && t.cmd.Process != nil {
-		t.cmd.Process.Kill()
+		t.cmd.Process.Signal(syscall.SIGTERM)
 		t.cmd.Wait()
 	}
 

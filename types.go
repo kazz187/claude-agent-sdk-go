@@ -3,6 +3,7 @@ package claudeagent
 import (
 	"context"
 	"encoding/json"
+	"sync"
 )
 
 // PermissionMode represents the permission mode for Claude operations.
@@ -14,6 +15,47 @@ const (
 	PermissionModePlan              PermissionMode = "plan"
 	PermissionModeBypassPermissions PermissionMode = "bypassPermissions"
 )
+
+// SdkBeta represents SDK beta feature flags.
+// See https://docs.anthropic.com/en/api/beta-headers
+type SdkBeta string
+
+const (
+	SdkBetaContext1M SdkBeta = "context-1m-2025-08-07"
+)
+
+// ToolsPreset represents a tools preset configuration.
+type ToolsPreset struct {
+	Type   string `json:"type"`   // "preset"
+	Preset string `json:"preset"` // "claude_code"
+}
+
+// ThinkingConfig represents the thinking configuration interface.
+type ThinkingConfig interface {
+	isThinkingConfig()
+	// GetType returns the type of thinking config.
+	GetType() string
+}
+
+// ThinkingConfigAdaptive enables adaptive thinking.
+type ThinkingConfigAdaptive struct{}
+
+func (ThinkingConfigAdaptive) isThinkingConfig() {}
+func (ThinkingConfigAdaptive) GetType() string   { return "adaptive" }
+
+// ThinkingConfigEnabled enables thinking with a specific budget.
+type ThinkingConfigEnabled struct {
+	BudgetTokens int `json:"budget_tokens"`
+}
+
+func (ThinkingConfigEnabled) isThinkingConfig() {}
+func (ThinkingConfigEnabled) GetType() string   { return "enabled" }
+
+// ThinkingConfigDisabled disables thinking.
+type ThinkingConfigDisabled struct{}
+
+func (ThinkingConfigDisabled) isThinkingConfig() {}
+func (ThinkingConfigDisabled) GetType() string   { return "disabled" }
 
 // SettingSource represents the source of settings.
 type SettingSource string
@@ -160,32 +202,48 @@ type CanUseToolFunc func(toolName string, input map[string]any, ctx ToolPermissi
 type HookEvent string
 
 const (
-	HookEventPreToolUse       HookEvent = "PreToolUse"
-	HookEventPostToolUse      HookEvent = "PostToolUse"
-	HookEventUserPromptSubmit HookEvent = "UserPromptSubmit"
-	HookEventStop             HookEvent = "Stop"
-	HookEventSubagentStop     HookEvent = "SubagentStop"
-	HookEventPreCompact       HookEvent = "PreCompact"
+	HookEventPreToolUse        HookEvent = "PreToolUse"
+	HookEventPostToolUse       HookEvent = "PostToolUse"
+	HookEventPostToolUseFail   HookEvent = "PostToolUseFailure"
+	HookEventUserPromptSubmit  HookEvent = "UserPromptSubmit"
+	HookEventStop              HookEvent = "Stop"
+	HookEventSubagentStop      HookEvent = "SubagentStop"
+	HookEventPreCompact        HookEvent = "PreCompact"
+	HookEventNotification      HookEvent = "Notification"
+	HookEventSubagentStart     HookEvent = "SubagentStart"
+	HookEventPermissionRequest HookEvent = "PermissionRequest"
 )
 
 // HookInput represents the input data for hook callbacks.
 type HookInput struct {
-	SessionID          string         `json:"session_id"`
-	TranscriptPath     string         `json:"transcript_path"`
-	Cwd                string         `json:"cwd"`
-	PermissionMode     string         `json:"permission_mode,omitempty"`
-	HookEventName      HookEvent      `json:"hook_event_name"`
-	ToolName           string         `json:"tool_name,omitempty"`
-	ToolInput          map[string]any `json:"tool_input,omitempty"`
-	ToolResponse       any            `json:"tool_response,omitempty"`
-	Prompt             string         `json:"prompt,omitempty"`
-	StopHookActive     bool           `json:"stop_hook_active,omitempty"`
-	Trigger            string         `json:"trigger,omitempty"`
-	CustomInstructions string         `json:"custom_instructions,omitempty"`
+	SessionID             string         `json:"session_id"`
+	TranscriptPath        string         `json:"transcript_path"`
+	Cwd                   string         `json:"cwd"`
+	PermissionMode        string         `json:"permission_mode,omitempty"`
+	HookEventName         HookEvent      `json:"hook_event_name"`
+	ToolName              string         `json:"tool_name,omitempty"`
+	ToolInput             map[string]any `json:"tool_input,omitempty"`
+	ToolResponse          any            `json:"tool_response,omitempty"`
+	ToolUseID             string         `json:"tool_use_id,omitempty"`
+	Error                 string         `json:"error,omitempty"`
+	IsInterrupt           bool           `json:"is_interrupt,omitempty"`
+	Prompt                string         `json:"prompt,omitempty"`
+	StopHookActive        bool           `json:"stop_hook_active,omitempty"`
+	Trigger               string         `json:"trigger,omitempty"`
+	CustomInstructions    string         `json:"custom_instructions,omitempty"`
+	AgentID               string         `json:"agent_id,omitempty"`
+	AgentTranscriptPath   string         `json:"agent_transcript_path,omitempty"`
+	AgentType             string         `json:"agent_type,omitempty"`
+	Message               string         `json:"message,omitempty"`
+	Title                 string         `json:"title,omitempty"`
+	NotificationType      string         `json:"notification_type,omitempty"`
+	PermissionSuggestions []any          `json:"permission_suggestions,omitempty"`
 }
 
 // HookOutput represents the output from hook callbacks.
 type HookOutput struct {
+	Async              *bool          `json:"async,omitempty"`
+	AsyncTimeout       *int           `json:"asyncTimeout,omitempty"`
 	Continue           *bool          `json:"continue,omitempty"`
 	SuppressOutput     bool           `json:"suppressOutput,omitempty"`
 	StopReason         string         `json:"stopReason,omitempty"`
@@ -308,8 +366,10 @@ type Message interface {
 
 // UserMessage represents a user message.
 type UserMessage struct {
-	Content         any    `json:"content"` // string or []ContentBlock
-	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	Content         any            `json:"content"` // string or []ContentBlock
+	UUID            string         `json:"uuid,omitempty"`
+	ParentToolUseID string         `json:"parent_tool_use_id,omitempty"`
+	ToolUseResult   map[string]any `json:"tool_use_result,omitempty"`
 }
 
 func (UserMessage) isMessage() {}
@@ -388,18 +448,22 @@ func (StreamEvent) isMessage() {}
 
 // ClaudeAgentOptions represents options for the Claude agent.
 type ClaudeAgentOptions struct {
-	AllowedTools             []string                    `json:"allowed_tools,omitempty"`
-	SystemPrompt             any                         `json:"system_prompt,omitempty"` // string or *SystemPromptPreset
-	McpServers               map[string]McpServerConfig  `json:"mcp_servers,omitempty"`
-	McpServersPath           string                      `json:"-"` // Alternative: path to MCP config file
-	PermissionMode           PermissionMode              `json:"permission_mode,omitempty"`
-	ContinueConversation     bool                        `json:"continue_conversation,omitempty"`
-	Resume                   string                      `json:"resume,omitempty"`
-	MaxTurns                 *int                        `json:"max_turns,omitempty"`
-	MaxBudgetUSD             *float64                    `json:"max_budget_usd,omitempty"`
-	DisallowedTools          []string                    `json:"disallowed_tools,omitempty"`
-	Model                    string                      `json:"model,omitempty"`
-	FallbackModel            string                      `json:"fallback_model,omitempty"`
+	// Tools specifies the base set of tools. Can be []string, *ToolsPreset, or nil.
+	Tools                any                        `json:"-"`
+	AllowedTools         []string                   `json:"allowed_tools,omitempty"`
+	SystemPrompt         any                        `json:"system_prompt,omitempty"` // string or *SystemPromptPreset
+	McpServers           map[string]McpServerConfig `json:"mcp_servers,omitempty"`
+	McpServersPath       string                     `json:"-"` // Alternative: path to MCP config file
+	PermissionMode       PermissionMode             `json:"permission_mode,omitempty"`
+	ContinueConversation bool                       `json:"continue_conversation,omitempty"`
+	Resume               string                     `json:"resume,omitempty"`
+	MaxTurns             *int                       `json:"max_turns,omitempty"`
+	MaxBudgetUSD         *float64                   `json:"max_budget_usd,omitempty"`
+	DisallowedTools      []string                   `json:"disallowed_tools,omitempty"`
+	Model                string                     `json:"model,omitempty"`
+	FallbackModel        string                     `json:"fallback_model,omitempty"`
+	// Betas specifies SDK beta features. See https://docs.anthropic.com/en/api/beta-headers
+	Betas                    []SdkBeta                   `json:"-"`
 	PermissionPromptToolName string                      `json:"permission_prompt_tool_name,omitempty"`
 	Cwd                      string                      `json:"cwd,omitempty"`
 	CLIPath                  string                      `json:"cli_path,omitempty"`
@@ -418,8 +482,16 @@ type ClaudeAgentOptions struct {
 	SettingSources           []SettingSource             `json:"setting_sources,omitempty"`
 	Sandbox                  *SandboxSettings            `json:"sandbox,omitempty"`
 	Plugins                  []SdkPluginConfig           `json:"plugins,omitempty"`
-	MaxThinkingTokens        *int                        `json:"max_thinking_tokens,omitempty"`
-	OutputFormat             map[string]any              `json:"output_format,omitempty"`
+	// MaxThinkingTokens is deprecated. Use Thinking instead.
+	MaxThinkingTokens *int `json:"max_thinking_tokens,omitempty"`
+	// Thinking controls extended thinking behavior. Takes precedence over MaxThinkingTokens.
+	Thinking ThinkingConfig `json:"-"`
+	// Effort controls thinking depth. Valid values: "low", "medium", "high", "max".
+	Effort       *string        `json:"-"`
+	OutputFormat map[string]any `json:"output_format,omitempty"`
+	// EnableFileCheckpointing enables file checkpointing to track file changes.
+	// When enabled, files can be rewound to their state at any user message.
+	EnableFileCheckpointing bool `json:"-"`
 }
 
 // SDK Control Protocol types
@@ -439,6 +511,70 @@ type SDKControlResponse struct {
 
 // RawMessage represents an unparsed message from the CLI.
 type RawMessage = map[string]any
+
+// ToolAnnotations represents annotations for an MCP tool.
+type ToolAnnotations struct {
+	ReadOnlyHint    *bool `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool `json:"openWorldHint,omitempty"`
+}
+
+// SdkMcpToolHandler is the handler function type for SDK MCP tools.
+type SdkMcpToolHandler func(arguments map[string]any) ([]map[string]any, error)
+
+// SdkMcpTool represents an SDK MCP tool definition.
+type SdkMcpTool struct {
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	InputSchema map[string]any    `json:"inputSchema,omitempty"`
+	Handler     SdkMcpToolHandler `json:"-"`
+	Annotations *ToolAnnotations  `json:"annotations,omitempty"`
+}
+
+// SdkMcpServer represents an in-process SDK MCP server.
+type SdkMcpServer struct {
+	Name    string
+	Version string
+	Tools   []SdkMcpTool
+	mu      sync.RWMutex
+}
+
+// NewSdkMcpServer creates a new SDK MCP server.
+func NewSdkMcpServer(name, version string) *SdkMcpServer {
+	return &SdkMcpServer{
+		Name:    name,
+		Version: version,
+	}
+}
+
+// AddTool adds a tool to the SDK MCP server.
+func (s *SdkMcpServer) AddTool(tool SdkMcpTool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Tools = append(s.Tools, tool)
+}
+
+// GetTools returns all tools from the SDK MCP server.
+func (s *SdkMcpServer) GetTools() []SdkMcpTool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tools := make([]SdkMcpTool, len(s.Tools))
+	copy(tools, s.Tools)
+	return tools
+}
+
+// FindTool finds a tool by name.
+func (s *SdkMcpServer) FindTool(name string) *SdkMcpTool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := range s.Tools {
+		if s.Tools[i].Name == name {
+			return &s.Tools[i]
+		}
+	}
+	return nil
+}
 
 // MarshalJSON provides custom JSON marshaling for ContentBlock slice.
 func marshalContentBlocks(blocks []ContentBlock) ([]byte, error) {

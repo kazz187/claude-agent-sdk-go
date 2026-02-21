@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,12 +15,15 @@ import (
 
 // Query handles bidirectional control protocol on top of Transport.
 // It manages control request/response routing, hook callbacks,
-// tool permission callbacks, message streaming, and initialization handshake.
+// tool permission callbacks, SDK MCP servers, message streaming,
+// and initialization handshake.
 type Query struct {
 	transport         Transport
 	isStreamingMode   bool
 	canUseTool        CanUseToolFunc
 	hooks             map[HookEvent][]HookMatcher
+	sdkMcpServers     map[string]*SdkMcpServer
+	agents            map[string]map[string]any
 	initializeTimeout time.Duration
 
 	// Control protocol state
@@ -30,6 +35,13 @@ type Query struct {
 	// Message stream
 	messageChan chan RawMessage
 	errorChan   chan error
+
+	// Track first result for proper stream closure with SDK MCP servers
+	firstResultOnce sync.Once
+	firstResultChan chan struct{}
+
+	// Stream close timeout
+	streamCloseTimeout time.Duration
 
 	// State
 	mu                   sync.Mutex
@@ -43,6 +55,15 @@ type Query struct {
 	wg     sync.WaitGroup
 }
 
+// QueryOptions contains options for creating a Query.
+type QueryOptions struct {
+	CanUseTool        CanUseToolFunc
+	Hooks             map[HookEvent][]HookMatcher
+	SdkMcpServers     map[string]*SdkMcpServer
+	Agents            map[string]map[string]any
+	InitializeTimeout time.Duration
+}
+
 // NewQuery creates a new Query.
 func NewQuery(transport Transport, isStreamingMode bool, options QueryOptions) *Query {
 	initTimeout := options.InitializeTimeout
@@ -50,30 +71,35 @@ func NewQuery(transport Transport, isStreamingMode bool, options QueryOptions) *
 		initTimeout = 60 * time.Second
 	}
 
+	// Parse stream close timeout from environment
+	streamCloseTimeout := 60 * time.Second
+	if timeoutStr := os.Getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"); timeoutStr != "" {
+		if ms, err := strconv.ParseInt(timeoutStr, 10, 64); err == nil {
+			streamCloseTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	q := &Query{
-		transport:         transport,
-		isStreamingMode:   isStreamingMode,
-		canUseTool:        options.CanUseTool,
-		hooks:             options.Hooks,
-		initializeTimeout: initTimeout,
-		pendingResponses:  make(map[string]chan map[string]any),
-		hookCallbacks:     make(map[string]HookCallback),
-		messageChan:       make(chan RawMessage, 100),
-		errorChan:         make(chan error, 1),
-		ctx:               ctx,
-		cancel:            cancel,
+		transport:          transport,
+		isStreamingMode:    isStreamingMode,
+		canUseTool:         options.CanUseTool,
+		hooks:              options.Hooks,
+		sdkMcpServers:      options.SdkMcpServers,
+		agents:             options.Agents,
+		initializeTimeout:  initTimeout,
+		pendingResponses:   make(map[string]chan map[string]any),
+		hookCallbacks:      make(map[string]HookCallback),
+		messageChan:        make(chan RawMessage, 100),
+		errorChan:          make(chan error, 1),
+		firstResultChan:    make(chan struct{}),
+		streamCloseTimeout: streamCloseTimeout,
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 
 	return q
-}
-
-// QueryOptions contains options for creating a Query.
-type QueryOptions struct {
-	CanUseTool        CanUseToolFunc
-	Hooks             map[HookEvent][]HookMatcher
-	InitializeTimeout time.Duration
 }
 
 // Start begins reading messages from transport.
@@ -96,11 +122,14 @@ func (q *Query) readMessages(ctx context.Context, msgChan <-chan RawMessage, err
 	for {
 		select {
 		case <-ctx.Done():
+			q.failPendingRequests(ctx.Err())
 			return
 		case <-q.ctx.Done():
+			q.failPendingRequests(q.ctx.Err())
 			return
 		case err, ok := <-errChan:
 			if ok && err != nil {
+				q.failPendingRequests(err)
 				select {
 				case q.errorChan <- err:
 				default:
@@ -108,6 +137,7 @@ func (q *Query) readMessages(ctx context.Context, msgChan <-chan RawMessage, err
 			}
 		case msg, ok := <-msgChan:
 			if !ok {
+				q.failPendingRequests(fmt.Errorf("transport closed"))
 				return
 			}
 
@@ -124,12 +154,18 @@ func (q *Query) readMessages(ctx context.Context, msgChan <-chan RawMessage, err
 			case "control_response":
 				q.handleControlResponse(msg)
 			case "control_request":
-				// Handle control request synchronously to ensure response is sent
-				// before reading next message
-				q.handleControlRequest(msg)
+				// Handle control request in a separate goroutine to avoid blocking reader
+				go q.handleControlRequest(msg)
 			case "control_cancel_request":
 				// TODO: Implement cancellation support
 			default:
+				// Track results for proper stream closure
+				if msgType == "result" {
+					q.firstResultOnce.Do(func() {
+						close(q.firstResultChan)
+					})
+				}
+
 				// Regular SDK messages go to the stream
 				select {
 				case q.messageChan <- msg:
@@ -140,6 +176,25 @@ func (q *Query) readMessages(ctx context.Context, msgChan <-chan RawMessage, err
 				}
 			}
 		}
+	}
+}
+
+// failPendingRequests sends error to all pending control requests.
+func (q *Query) failPendingRequests(err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for requestID, ch := range q.pendingResponses {
+		errResponse := map[string]any{
+			"subtype":    "error",
+			"request_id": requestID,
+			"error":      err.Error(),
+		}
+		select {
+		case ch <- errResponse:
+		default:
+		}
+		delete(q.pendingResponses, requestID)
 	}
 }
 
@@ -188,6 +243,8 @@ func (q *Query) handleControlRequest(msg RawMessage) {
 		responseData, err = q.handleCanUseTool(requestData)
 	case "hook_callback":
 		responseData, err = q.handleHookCallback(requestData)
+	case "mcp_message":
+		responseData, err = q.handleMcpMessage(requestData)
 	default:
 		err = fmt.Errorf("unsupported control request subtype: %s", subtype)
 	}
@@ -324,6 +381,15 @@ func (q *Query) handleHookCallback(requestData map[string]any) (map[string]any, 
 	if v, ok := inputData["tool_response"]; ok {
 		input.ToolResponse = v
 	}
+	if v, ok := inputData["tool_use_id"].(string); ok {
+		input.ToolUseID = v
+	}
+	if v, ok := inputData["error"].(string); ok {
+		input.Error = v
+	}
+	if v, ok := inputData["is_interrupt"].(bool); ok {
+		input.IsInterrupt = v
+	}
 	if v, ok := inputData["prompt"].(string); ok {
 		input.Prompt = v
 	}
@@ -335,6 +401,27 @@ func (q *Query) handleHookCallback(requestData map[string]any) (map[string]any, 
 	}
 	if v, ok := inputData["custom_instructions"].(string); ok {
 		input.CustomInstructions = v
+	}
+	if v, ok := inputData["agent_id"].(string); ok {
+		input.AgentID = v
+	}
+	if v, ok := inputData["agent_transcript_path"].(string); ok {
+		input.AgentTranscriptPath = v
+	}
+	if v, ok := inputData["agent_type"].(string); ok {
+		input.AgentType = v
+	}
+	if v, ok := inputData["message"].(string); ok {
+		input.Message = v
+	}
+	if v, ok := inputData["title"].(string); ok {
+		input.Title = v
+	}
+	if v, ok := inputData["notification_type"].(string); ok {
+		input.NotificationType = v
+	}
+	if v, ok := inputData["permission_suggestions"].([]any); ok {
+		input.PermissionSuggestions = v
 	}
 
 	ctx := HookContext{
@@ -348,6 +435,12 @@ func (q *Query) handleHookCallback(requestData map[string]any) (map[string]any, 
 
 	// Convert output to map
 	result := make(map[string]any)
+	if output.Async != nil {
+		result["async"] = *output.Async
+	}
+	if output.AsyncTimeout != nil {
+		result["asyncTimeout"] = *output.AsyncTimeout
+	}
 	if output.Continue != nil {
 		result["continue"] = *output.Continue
 	}
@@ -371,6 +464,165 @@ func (q *Query) handleHookCallback(requestData map[string]any) (map[string]any, 
 	}
 
 	return result, nil
+}
+
+// handleMcpMessage handles SDK MCP server requests.
+func (q *Query) handleMcpMessage(requestData map[string]any) (map[string]any, error) {
+	serverName, _ := requestData["server_name"].(string)
+	message, _ := requestData["message"].(map[string]any)
+
+	if serverName == "" || message == nil {
+		return nil, fmt.Errorf("missing server_name or message for MCP request")
+	}
+
+	mcpResponse := q.handleSdkMcpRequest(serverName, message)
+	return map[string]any{"mcp_response": mcpResponse}, nil
+}
+
+// handleSdkMcpRequest handles an MCP JSONRPC request for an SDK server.
+func (q *Query) handleSdkMcpRequest(serverName string, message map[string]any) map[string]any {
+	if q.sdkMcpServers == nil {
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      message["id"],
+			"error": map[string]any{
+				"code":    -32601,
+				"message": fmt.Sprintf("Server '%s' not found", serverName),
+			},
+		}
+	}
+
+	server, ok := q.sdkMcpServers[serverName]
+	if !ok {
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      message["id"],
+			"error": map[string]any{
+				"code":    -32601,
+				"message": fmt.Sprintf("Server '%s' not found", serverName),
+			},
+		}
+	}
+
+	method, _ := message["method"].(string)
+	params, _ := message["params"].(map[string]any)
+
+	switch method {
+	case "initialize":
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      message["id"],
+			"result": map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities": map[string]any{
+					"tools": map[string]any{},
+				},
+				"serverInfo": map[string]any{
+					"name":    server.Name,
+					"version": server.Version,
+				},
+			},
+		}
+
+	case "tools/list":
+		tools := server.GetTools()
+		toolsData := make([]map[string]any, len(tools))
+		for i, tool := range tools {
+			toolData := map[string]any{
+				"name": tool.Name,
+			}
+			if tool.Description != "" {
+				toolData["description"] = tool.Description
+			}
+			if tool.InputSchema != nil {
+				toolData["inputSchema"] = tool.InputSchema
+			} else {
+				toolData["inputSchema"] = map[string]any{}
+			}
+			if tool.Annotations != nil {
+				annots := map[string]any{}
+				if tool.Annotations.ReadOnlyHint != nil {
+					annots["readOnlyHint"] = *tool.Annotations.ReadOnlyHint
+				}
+				if tool.Annotations.DestructiveHint != nil {
+					annots["destructiveHint"] = *tool.Annotations.DestructiveHint
+				}
+				if tool.Annotations.IdempotentHint != nil {
+					annots["idempotentHint"] = *tool.Annotations.IdempotentHint
+				}
+				if tool.Annotations.OpenWorldHint != nil {
+					annots["openWorldHint"] = *tool.Annotations.OpenWorldHint
+				}
+				if len(annots) > 0 {
+					toolData["annotations"] = annots
+				}
+			}
+			toolsData[i] = toolData
+		}
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      message["id"],
+			"result":  map[string]any{"tools": toolsData},
+		}
+
+	case "tools/call":
+		toolName, _ := params["name"].(string)
+		arguments, _ := params["arguments"].(map[string]any)
+
+		tool := server.FindTool(toolName)
+		if tool == nil {
+			return map[string]any{
+				"jsonrpc": "2.0",
+				"id":      message["id"],
+				"error": map[string]any{
+					"code":    -32601,
+					"message": fmt.Sprintf("Tool '%s' not found", toolName),
+				},
+			}
+		}
+
+		if tool.Handler == nil {
+			return map[string]any{
+				"jsonrpc": "2.0",
+				"id":      message["id"],
+				"error": map[string]any{
+					"code":    -32603,
+					"message": fmt.Sprintf("Tool '%s' has no handler", toolName),
+				},
+			}
+		}
+
+		content, err := tool.Handler(arguments)
+		if err != nil {
+			return map[string]any{
+				"jsonrpc": "2.0",
+				"id":      message["id"],
+				"result": map[string]any{
+					"content":  []map[string]any{{"type": "text", "text": err.Error()}},
+					"is_error": true,
+				},
+			}
+		}
+
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      message["id"],
+			"result":  map[string]any{"content": content},
+		}
+
+	case "notifications/initialized":
+		return map[string]any{"jsonrpc": "2.0", "result": map[string]any{}}
+
+	default:
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      message["id"],
+			"error": map[string]any{
+				"code":    -32601,
+				"message": fmt.Sprintf("Method '%s' not found", method),
+			},
+		}
+	}
 }
 
 // sendControlRequest sends a control request to CLI and waits for response.
@@ -479,6 +731,11 @@ func (q *Query) Initialize() (map[string]any, error) {
 	}
 	if len(hooksConfig) > 0 {
 		request["hooks"] = hooksConfig
+	} else {
+		request["hooks"] = nil
+	}
+	if q.agents != nil {
+		request["agents"] = q.agents
 	}
 
 	response, err := q.sendControlRequest(request, q.initializeTimeout)
@@ -509,15 +766,32 @@ func (q *Query) SetPermissionMode(mode string) error {
 	return err
 }
 
-// SetModel changes the AI model.
-func (q *Query) SetModel(model string) error {
+// SetModel changes the AI model. Pass nil to use default.
+func (q *Query) SetModel(model *string) error {
 	request := map[string]any{
 		"subtype": "set_model",
 	}
-	if model != "" {
-		request["model"] = model
+	if model != nil {
+		request["model"] = *model
+	} else {
+		// Explicitly send null to reset to default
+		request["model"] = nil
 	}
 	_, err := q.sendControlRequest(request, 60*time.Second)
+	return err
+}
+
+// GetMcpStatus gets current MCP server connection status.
+func (q *Query) GetMcpStatus() (map[string]any, error) {
+	return q.sendControlRequest(map[string]any{"subtype": "mcp_status"}, 60*time.Second)
+}
+
+// RewindFiles rewinds tracked files to their state at a specific user message.
+func (q *Query) RewindFiles(userMessageID string) error {
+	_, err := q.sendControlRequest(map[string]any{
+		"subtype":         "rewind_files",
+		"user_message_id": userMessageID,
+	}, 60*time.Second)
 	return err
 }
 
@@ -539,16 +813,18 @@ func (q *Query) GetInitializationResult() map[string]any {
 }
 
 // StreamInput streams input messages to transport.
+// If SDK MCP servers or hooks are present, waits for the first result
+// before closing stdin to allow bidirectional control protocol communication.
 func (q *Query) StreamInput(ctx context.Context, messages <-chan map[string]any) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return q.transport.EndInput()
+			return q.endInputWithWait()
 		case <-q.ctx.Done():
-			return q.transport.EndInput()
+			return q.endInputWithWait()
 		case msg, ok := <-messages:
 			if !ok {
-				return q.transport.EndInput()
+				return q.endInputWithWait()
 			}
 			data, err := json.Marshal(msg)
 			if err != nil {
@@ -559,6 +835,26 @@ func (q *Query) StreamInput(ctx context.Context, messages <-chan map[string]any)
 			}
 		}
 	}
+}
+
+// endInputWithWait waits for first result if SDK MCP servers or hooks are present
+// before ending input.
+func (q *Query) endInputWithWait() error {
+	hasHooks := len(q.hooks) > 0
+	hasSdkMcp := len(q.sdkMcpServers) > 0
+
+	if hasSdkMcp || hasHooks {
+		// Wait for first result before closing stdin
+		timer := time.NewTimer(q.streamCloseTimeout)
+		defer timer.Stop()
+		select {
+		case <-q.firstResultChan:
+		case <-timer.C:
+		case <-q.ctx.Done():
+		}
+	}
+
+	return q.transport.EndInput()
 }
 
 // Close closes the query and transport.

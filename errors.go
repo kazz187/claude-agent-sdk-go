@@ -38,15 +38,18 @@ func NewCLIConnectionError(message string, cause error) *CLIConnectionError {
 }
 
 // CLINotFoundError indicates the Claude CLI was not found.
+// It embeds CLIConnectionError to match the Python SDK's inheritance hierarchy.
 type CLINotFoundError struct {
-	ClaudeSDKError
+	CLIConnectionError
 }
 
 // NewCLINotFoundError creates a new CLINotFoundError.
 func NewCLINotFoundError(message string) *CLINotFoundError {
 	return &CLINotFoundError{
-		ClaudeSDKError: ClaudeSDKError{
-			Message: message,
+		CLIConnectionError: CLIConnectionError{
+			ClaudeSDKError: ClaudeSDKError{
+				Message: message,
+			},
 		},
 	}
 }
@@ -59,7 +62,11 @@ type ProcessError struct {
 }
 
 func (e *ProcessError) Error() string {
-	return fmt.Sprintf("%s (exit code: %d)", e.Message, e.ExitCode)
+	msg := fmt.Sprintf("%s (exit code: %d)", e.Message, e.ExitCode)
+	if e.Stderr != "" {
+		msg = fmt.Sprintf("%s\nError output: %s", msg, e.Stderr)
+	}
+	return msg
 }
 
 // NewProcessError creates a new ProcessError.

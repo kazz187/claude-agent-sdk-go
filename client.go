@@ -5,21 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
 
 // ClaudeSDKClient provides a client for bidirectional, interactive conversations with Claude Code.
-//
-// This client provides full control over the conversation flow with support
-// for streaming, interrupts, and dynamic message sending. For simple one-shot
-// queries, consider using the Query() function instead.
-//
-// Key features:
-//   - Bidirectional: Send and receive messages at any time
-//   - Stateful: Maintains conversation context across messages
-//   - Interactive: Send follow-ups based on responses
-//   - Control flow: Support for interrupts and session management
 type ClaudeSDKClient struct {
 	options         ClaudeAgentOptions
 	customTransport Transport
@@ -99,7 +90,7 @@ func (c *ClaudeSDKClient) ConnectWithPrompt(ctx context.Context, prompt string) 
 	if c.customTransport != nil {
 		c.transport = c.customTransport
 	} else {
-		// Streaming mode: empty prompt
+		// Always streaming mode
 		c.transport = NewSubprocessTransport(prompt, opts)
 	}
 
@@ -108,21 +99,57 @@ func (c *ClaudeSDKClient) ConnectWithPrompt(ctx context.Context, prompt string) 
 		return err
 	}
 
+	// Extract SDK MCP servers from options
+	sdkMcpServers := make(map[string]*SdkMcpServer)
+	if opts.McpServers != nil {
+		for name, config := range opts.McpServers {
+			if config.Type == McpServerTypeSDK {
+				// SDK MCP servers need to have an associated SdkMcpServer instance
+				// stored externally. For now, we skip ones without instances.
+				// Users should use the SdkMcpServers field on ClaudeAgentOptions
+				// or provide them through the McpServerConfig mechanism.
+				_ = name
+			}
+		}
+	}
+
+	// Convert agents to dict format for initialize request
+	var agentsDict map[string]map[string]any
+	if opts.Agents != nil {
+		agentsDict = make(map[string]map[string]any)
+		for name, agent := range opts.Agents {
+			agentMap := map[string]any{
+				"description": agent.Description,
+				"prompt":      agent.Prompt,
+			}
+			if len(agent.Tools) > 0 {
+				agentMap["tools"] = agent.Tools
+			}
+			if agent.Model != "" {
+				agentMap["model"] = agent.Model
+			}
+			agentsDict[name] = agentMap
+		}
+	}
+
 	// Calculate initialize timeout from env var if set
 	initTimeout := 60 * time.Second
 	if timeoutStr := os.Getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"); timeoutStr != "" {
-		if ms, err := time.ParseDuration(timeoutStr + "ms"); err == nil {
-			if ms > initTimeout {
-				initTimeout = ms
+		if ms, err := strconv.ParseInt(timeoutStr, 10, 64); err == nil {
+			t := time.Duration(ms) * time.Millisecond
+			if t > initTimeout {
+				initTimeout = t
 			}
 		}
 	}
 
 	// Create Query to handle control protocol
-	isStreaming := prompt == ""
+	isStreaming := true // ClaudeSDKClient always uses streaming mode
 	c.query = NewQuery(c.transport, isStreaming, QueryOptions{
 		CanUseTool:        opts.CanUseTool,
 		Hooks:             c.convertHooksToInternalFormat(opts.Hooks),
+		SdkMcpServers:     sdkMcpServers,
+		Agents:            agentsDict,
 		InitializeTimeout: initTimeout,
 	})
 
@@ -133,13 +160,11 @@ func (c *ClaudeSDKClient) ConnectWithPrompt(ctx context.Context, prompt string) 
 		return err
 	}
 
-	if isStreaming {
-		if _, err := c.query.Initialize(); err != nil {
-			c.query.Close()
-			c.query = nil
-			c.transport = nil
-			return err
-		}
+	if _, err := c.query.Initialize(); err != nil {
+		c.query.Close()
+		c.query = nil
+		c.transport = nil
+		return err
 	}
 
 	// Start the message parsing goroutine
@@ -151,7 +176,6 @@ func (c *ClaudeSDKClient) ConnectWithPrompt(ctx context.Context, prompt string) 
 }
 
 // parseMessages is a single goroutine that parses raw messages into typed messages.
-// This runs for the lifetime of the connection.
 func (c *ClaudeSDKClient) parseMessages(ctx context.Context) {
 	defer close(c.parsedMsgChan)
 	defer close(c.parsedErrChan)
@@ -185,6 +209,11 @@ func (c *ClaudeSDKClient) parseMessages(ctx context.Context) {
 				continue
 			}
 
+			// Skip nil messages (unknown types - forward compatible)
+			if msg == nil {
+				continue
+			}
+
 			select {
 			case c.parsedMsgChan <- msg:
 			case <-ctx.Done():
@@ -195,11 +224,6 @@ func (c *ClaudeSDKClient) parseMessages(ctx context.Context) {
 }
 
 // ReceiveMessages returns channels for receiving parsed messages and errors from Claude.
-// The message channel yields parsed Message objects until the connection is closed.
-// The error channel reports any errors that occur during message reception.
-//
-// IMPORTANT: These are shared channels - all callers receive from the same channels.
-// For most use cases, use ReceiveResponse which reads until a ResultMessage is received.
 func (c *ClaudeSDKClient) ReceiveMessages(ctx context.Context) (<-chan Message, <-chan error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -249,6 +273,19 @@ func (c *ClaudeSDKClient) SendQueryWithSessionID(ctx context.Context, prompt str
 	return transport.Write(ctx, string(data)+"\n")
 }
 
+// SendQueryStream sends messages from a channel in streaming mode.
+func (c *ClaudeSDKClient) SendQueryStream(ctx context.Context, messages <-chan map[string]any) error {
+	c.mu.Lock()
+	query := c.query
+	c.mu.Unlock()
+
+	if query == nil {
+		return ErrNotConnected
+	}
+
+	return query.StreamInput(ctx, messages)
+}
+
 // Interrupt sends an interrupt signal (only works with streaming mode).
 func (c *ClaudeSDKClient) Interrupt() error {
 	c.mu.Lock()
@@ -263,11 +300,6 @@ func (c *ClaudeSDKClient) Interrupt() error {
 }
 
 // SetPermissionMode changes the permission mode during conversation (streaming mode only).
-//
-// Valid modes:
-//   - "default": CLI prompts for dangerous tools
-//   - "acceptEdits": Auto-accept file edits
-//   - "bypassPermissions": Allow all tools (use with caution)
 func (c *ClaudeSDKClient) SetPermissionMode(mode PermissionMode) error {
 	c.mu.Lock()
 	query := c.query
@@ -281,7 +313,8 @@ func (c *ClaudeSDKClient) SetPermissionMode(mode PermissionMode) error {
 }
 
 // SetModel changes the AI model during conversation (streaming mode only).
-func (c *ClaudeSDKClient) SetModel(model string) error {
+// Pass nil to use the default model.
+func (c *ClaudeSDKClient) SetModel(model *string) error {
 	c.mu.Lock()
 	query := c.query
 	c.mu.Unlock()
@@ -291,6 +324,33 @@ func (c *ClaudeSDKClient) SetModel(model string) error {
 	}
 
 	return query.SetModel(model)
+}
+
+// RewindFiles rewinds tracked files to their state at a specific user message.
+// Requires EnableFileCheckpointing to be set in options.
+func (c *ClaudeSDKClient) RewindFiles(ctx context.Context, userMessageID string) error {
+	c.mu.Lock()
+	query := c.query
+	c.mu.Unlock()
+
+	if query == nil {
+		return ErrNotConnected
+	}
+
+	return query.RewindFiles(userMessageID)
+}
+
+// GetMcpStatus gets current MCP server connection status.
+func (c *ClaudeSDKClient) GetMcpStatus(ctx context.Context) (map[string]any, error) {
+	c.mu.Lock()
+	query := c.query
+	c.mu.Unlock()
+
+	if query == nil {
+		return nil, ErrNotConnected
+	}
+
+	return query.GetMcpStatus()
 }
 
 // GetServerInfo returns server initialization info including available commands.
@@ -329,8 +389,12 @@ func (c *ClaudeSDKClient) Close() error {
 	return nil
 }
 
+// Disconnect is an alias for Close.
+func (c *ClaudeSDKClient) Disconnect() error {
+	return c.Close()
+}
+
 // ReceiveResponse is a convenience method that receives messages until a ResultMessage is received.
-// It returns all received messages including the final ResultMessage.
 func (c *ClaudeSDKClient) ReceiveResponse(ctx context.Context) ([]Message, error) {
 	c.mu.Lock()
 	msgChan := c.parsedMsgChan

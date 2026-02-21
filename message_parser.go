@@ -1,10 +1,7 @@
 package claudeagent
 
-import (
-	"fmt"
-)
-
 // ParseMessage parses a raw message from CLI output into a typed Message.
+// Returns nil, nil for unknown message types (forward-compatible).
 func ParseMessage(data RawMessage) (Message, error) {
 	if data == nil {
 		return nil, NewMessageParseError("message data is nil", data)
@@ -27,7 +24,9 @@ func ParseMessage(data RawMessage) (Message, error) {
 	case "stream_event":
 		return parseStreamEvent(data)
 	default:
-		return nil, NewMessageParseError(fmt.Sprintf("unknown message type: %s", msgType), data)
+		// Forward-compatible: skip unrecognized message types so newer
+		// CLI versions don't crash older SDK versions.
+		return nil, nil
 	}
 }
 
@@ -37,6 +36,16 @@ func parseUserMessage(data RawMessage) (*UserMessage, error) {
 	// Get parent_tool_use_id
 	if parentID, ok := data["parent_tool_use_id"].(string); ok {
 		msg.ParentToolUseID = parentID
+	}
+
+	// Get uuid
+	if uuid, ok := data["uuid"].(string); ok {
+		msg.UUID = uuid
+	}
+
+	// Get tool_use_result
+	if tur, ok := data["tool_use_result"].(map[string]any); ok {
+		msg.ToolUseResult = tur
 	}
 
 	// Get message content
@@ -68,6 +77,11 @@ func parseAssistantMessage(data RawMessage) (*AssistantMessage, error) {
 	// Get parent_tool_use_id
 	if parentID, ok := data["parent_tool_use_id"].(string); ok {
 		msg.ParentToolUseID = parentID
+	}
+
+	// Get error field
+	if errStr, ok := data["error"].(string); ok {
+		msg.Error = AssistantMessageError(errStr)
 	}
 
 	// Get message data

@@ -2,6 +2,10 @@ package claudeagent
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"strconv"
+	"time"
 )
 
 // QueryResult contains the result of a one-shot query.
@@ -15,22 +19,6 @@ type QueryResult struct {
 // bidirectional communication.
 //
 // For more control over the conversation, use ClaudeSDKClient instead.
-//
-// Example:
-//
-//	msgChan, errChan := claude.RunQuery(ctx, "What is 2 + 2?", nil)
-//	for msg := range msgChan {
-//	    switch m := msg.(type) {
-//	    case *claude.AssistantMessage:
-//	        for _, block := range m.Content {
-//	            if tb, ok := block.(claude.TextBlock); ok {
-//	                fmt.Println(tb.Text)
-//	            }
-//	        }
-//	    case *claude.ResultMessage:
-//	        fmt.Printf("Cost: $%.4f\n", *m.TotalCostUSD)
-//	    }
-//	}
 func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (<-chan Message, <-chan error) {
 	msgChan := make(chan Message, 100)
 	errChan := make(chan error, 1)
@@ -44,8 +32,17 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 			opts = *options
 		}
 
-		// Create subprocess transport with prompt (non-streaming mode)
-		transport := NewSubprocessTransport(prompt, opts)
+		// Validate and configure permission settings
+		if opts.CanUseTool != nil {
+			if opts.PermissionPromptToolName != "" {
+				errChan <- NewCLIConnectionError("CanUseTool callback cannot be used with PermissionPromptToolName", nil)
+				return
+			}
+			opts.PermissionPromptToolName = "stdio"
+		}
+
+		// Create subprocess transport (always streaming mode)
+		transport := NewSubprocessTransport("", opts)
 
 		if err := transport.Connect(ctx); err != nil {
 			errChan <- err
@@ -53,14 +50,117 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 		}
 		defer transport.Close()
 
-		// Read messages
-		rawMsgChan, rawErrChan := transport.ReadMessages(ctx)
+		// Extract SDK MCP servers
+		sdkMcpServers := make(map[string]*SdkMcpServer)
+
+		// Convert agents to dict format
+		var agentsDict map[string]map[string]any
+		if opts.Agents != nil {
+			agentsDict = make(map[string]map[string]any)
+			for name, agent := range opts.Agents {
+				agentMap := map[string]any{
+					"description": agent.Description,
+					"prompt":      agent.Prompt,
+				}
+				if len(agent.Tools) > 0 {
+					agentMap["tools"] = agent.Tools
+				}
+				if agent.Model != "" {
+					agentMap["model"] = agent.Model
+				}
+				agentsDict[name] = agentMap
+			}
+		}
+
+		// Calculate initialize timeout
+		initTimeout := 60 * time.Second
+		if timeoutStr := os.Getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"); timeoutStr != "" {
+			if ms, err := strconv.ParseInt(timeoutStr, 10, 64); err == nil {
+				t := time.Duration(ms) * time.Millisecond
+				if t > initTimeout {
+					initTimeout = t
+				}
+			}
+		}
+
+		// Create Query with full options
+		query := NewQuery(transport, true, QueryOptions{
+			CanUseTool:        opts.CanUseTool,
+			Hooks:             opts.Hooks,
+			SdkMcpServers:     sdkMcpServers,
+			Agents:            agentsDict,
+			InitializeTimeout: initTimeout,
+		})
+
+		// Start reading messages
+		if err := query.Start(ctx); err != nil {
+			errChan <- err
+			return
+		}
+		defer query.Close()
+
+		// Initialize (sends hooks, agents via control protocol)
+		if _, err := query.Initialize(); err != nil {
+			errChan <- err
+			return
+		}
+
+		// Send the user message via stdin
+		message := map[string]any{
+			"type": "user",
+			"message": map[string]any{
+				"role":    "user",
+				"content": prompt,
+			},
+			"parent_tool_use_id": nil,
+			"session_id":         "default",
+		}
+
+		data, err := json.Marshal(message)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		if err := transport.Write(ctx, string(data)+"\n"); err != nil {
+			errChan <- err
+			return
+		}
+
+		// If we have SDK MCP servers or hooks, wait for first result before ending input
+		hasHooks := len(opts.Hooks) > 0
+		hasSdkMcp := len(sdkMcpServers) > 0
+		if hasSdkMcp || hasHooks {
+			// Let StreamInput handle the wait
+			go func() {
+				streamCloseTimeout := 60 * time.Second
+				if timeoutStr := os.Getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"); timeoutStr != "" {
+					if ms, err := strconv.ParseInt(timeoutStr, 10, 64); err == nil {
+						streamCloseTimeout = time.Duration(ms) * time.Millisecond
+					}
+				}
+				timer := time.NewTimer(streamCloseTimeout)
+				defer timer.Stop()
+				select {
+				case <-query.firstResultChan:
+				case <-timer.C:
+				case <-ctx.Done():
+				}
+				transport.EndInput()
+			}()
+		} else {
+			transport.EndInput()
+		}
+
+		// Read and parse messages
+		rawMsgChan := query.ReceiveMessages()
+		queryErrChan := query.Errors()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case err, ok := <-rawErrChan:
+			case err, ok := <-queryErrChan:
 				if ok && err != nil {
 					// Check if it's a process error with exit code 0 (normal termination)
 					if pe, ok := err.(*ProcessError); ok && pe.ExitCode == 0 {
@@ -77,6 +177,11 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 				msg, err := ParseMessage(rawMsg)
 				if err != nil {
 					errChan <- err
+					continue
+				}
+
+				// Skip nil messages (unknown types)
+				if msg == nil {
 					continue
 				}
 
