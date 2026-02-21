@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // PermissionMode represents the permission mode for Claude operations.
@@ -446,6 +448,12 @@ type StreamEvent struct {
 
 func (StreamEvent) isMessage() {}
 
+// OutputFormat represents the output format configuration for Claude.
+type OutputFormat struct {
+	Type   string             `json:"type"`
+	Schema *jsonschema.Schema `json:"schema,omitempty"`
+}
+
 // ClaudeAgentOptions represents options for the Claude agent.
 type ClaudeAgentOptions struct {
 	// Tools specifies the base set of tools. Can be []string, *ToolsPreset, or nil.
@@ -487,8 +495,8 @@ type ClaudeAgentOptions struct {
 	// Thinking controls extended thinking behavior. Takes precedence over MaxThinkingTokens.
 	Thinking ThinkingConfig `json:"-"`
 	// Effort controls thinking depth. Valid values: "low", "medium", "high", "max".
-	Effort       *string        `json:"-"`
-	OutputFormat map[string]any `json:"output_format,omitempty"`
+	Effort       *string       `json:"-"`
+	OutputFormat *OutputFormat `json:"output_format,omitempty"`
 	// EnableFileCheckpointing enables file checkpointing to track file changes.
 	// When enabled, files can be rewound to their state at any user message.
 	EnableFileCheckpointing bool `json:"-"`
@@ -528,11 +536,11 @@ type SdkMcpToolHandler func(arguments map[string]any) ([]map[string]any, error)
 
 // SdkMcpTool represents an SDK MCP tool definition.
 type SdkMcpTool struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description,omitempty"`
-	InputSchema map[string]any    `json:"inputSchema,omitempty"`
-	Handler     SdkMcpToolHandler `json:"-"`
-	Annotations *ToolAnnotations  `json:"annotations,omitempty"`
+	Name        string             `json:"name"`
+	Description string             `json:"description,omitempty"`
+	InputSchema *jsonschema.Schema `json:"inputSchema,omitempty"`
+	Handler     SdkMcpToolHandler  `json:"-"`
+	Annotations *ToolAnnotations   `json:"annotations,omitempty"`
 }
 
 // SdkMcpServer represents an in-process SDK MCP server.

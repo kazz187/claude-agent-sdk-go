@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 func TestParseMessage_UserMessage(t *testing.T) {
@@ -883,10 +885,10 @@ func TestHandleSdkMcpRequest_ToolsList(t *testing.T) {
 	server.AddTool(SdkMcpTool{
 		Name:        "my-tool",
 		Description: "My test tool",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"arg": map[string]any{"type": "string"},
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"arg": {Type: "string"},
 			},
 		},
 	})

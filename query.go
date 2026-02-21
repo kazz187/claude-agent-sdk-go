@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // Query handles bidirectional control protocol on top of Transport.
@@ -537,7 +539,7 @@ func (q *Query) handleSdkMcpRequest(serverName string, message map[string]any) m
 			if tool.InputSchema != nil {
 				toolData["inputSchema"] = tool.InputSchema
 			} else {
-				toolData["inputSchema"] = map[string]any{}
+				toolData["inputSchema"] = &jsonschema.Schema{}
 			}
 			if tool.Annotations != nil {
 				annots := map[string]any{}

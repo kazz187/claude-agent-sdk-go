@@ -371,9 +371,9 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 
 	// Output format (JSON schema)
 	if t.options.OutputFormat != nil {
-		if t.options.OutputFormat["type"] == "json_schema" {
-			if schema, ok := t.options.OutputFormat["schema"]; ok {
-				schemaData, err := json.Marshal(schema)
+		if t.options.OutputFormat.Type == "json_schema" {
+			if t.options.OutputFormat.Schema != nil {
+				schemaData, err := json.Marshal(t.options.OutputFormat.Schema)
 				if err != nil {
 					return nil, fmt.Errorf("failed to marshal JSON schema: %w", err)
 				}
