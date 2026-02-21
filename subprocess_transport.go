@@ -382,6 +382,15 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		}
 	}
 
+	// Worktree
+	if t.options.Worktree != nil {
+		if *t.options.Worktree != "" {
+			cmd = append(cmd, "--worktree", *t.options.Worktree)
+		} else {
+			cmd = append(cmd, "--worktree")
+		}
+	}
+
 	// Always use streaming mode with stdin (matching TypeScript/Python SDK)
 	cmd = append(cmd, "--input-format", "stream-json")
 

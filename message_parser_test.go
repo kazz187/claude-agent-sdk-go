@@ -520,6 +520,86 @@ func TestBuildCommand_Effort(t *testing.T) {
 	}
 }
 
+func TestBuildCommand_WorktreeWithName(t *testing.T) {
+	cliPath := createFakeCLI(t)
+	name := "my-feature"
+	transport := &SubprocessTransport{
+		options: ClaudeAgentOptions{
+			Worktree: &name,
+			CLIPath:  cliPath,
+		},
+		isStreaming:   true,
+		maxBufferSize: defaultMaxBufferSize,
+	}
+
+	cmd, err := transport.buildCommand()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cmdStr := strings.Join(cmd, " ")
+	if !strings.Contains(cmdStr, "--worktree my-feature") {
+		t.Errorf("expected --worktree my-feature in command, got: %s", cmdStr)
+	}
+}
+
+func TestBuildCommand_WorktreeAutoNamed(t *testing.T) {
+	cliPath := createFakeCLI(t)
+	name := ""
+	transport := &SubprocessTransport{
+		options: ClaudeAgentOptions{
+			Worktree: &name,
+			CLIPath:  cliPath,
+		},
+		isStreaming:   true,
+		maxBufferSize: defaultMaxBufferSize,
+	}
+
+	cmd, err := transport.buildCommand()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should have --worktree without a value argument
+	found := false
+	for i, arg := range cmd {
+		if arg == "--worktree" {
+			// Next arg should NOT be the worktree name (it should be another flag or end of slice)
+			if i+1 >= len(cmd) || strings.HasPrefix(cmd[i+1], "--") {
+				found = true
+			} else {
+				t.Errorf("expected --worktree without value, but found: --worktree %s", cmd[i+1])
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected --worktree in command, got: %s", strings.Join(cmd, " "))
+	}
+}
+
+func TestBuildCommand_WorktreeNil(t *testing.T) {
+	cliPath := createFakeCLI(t)
+	transport := &SubprocessTransport{
+		options: ClaudeAgentOptions{
+			Worktree: nil,
+			CLIPath:  cliPath,
+		},
+		isStreaming:   true,
+		maxBufferSize: defaultMaxBufferSize,
+	}
+
+	cmd, err := transport.buildCommand()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cmdStr := strings.Join(cmd, " ")
+	if strings.Contains(cmdStr, "--worktree") {
+		t.Errorf("expected no --worktree in command, got: %s", cmdStr)
+	}
+}
+
 func TestBuildCommand_MaxBudgetFormat(t *testing.T) {
 	cliPath := createFakeCLI(t)
 	budget := 1.5

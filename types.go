@@ -492,6 +492,9 @@ type ClaudeAgentOptions struct {
 	// EnableFileCheckpointing enables file checkpointing to track file changes.
 	// When enabled, files can be rewound to their state at any user message.
 	EnableFileCheckpointing bool `json:"-"`
+	// Worktree creates a new git worktree for this session.
+	// If non-nil, --worktree is passed. Empty string means auto-named worktree.
+	Worktree *string `json:"-"`
 }
 
 // SDK Control Protocol types
