@@ -1,6 +1,7 @@
 package claudeagent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -9,15 +10,24 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
+// mustMarshal marshals v to JSON or panics. Used for building test data.
+func mustMarshal(v any) json.RawMessage {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
 func TestParseMessage_UserMessage(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type": "user",
 		"message": map[string]any{
 			"role":    "user",
 			"content": "Hello, Claude!",
 		},
 		"parent_tool_use_id": nil,
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -35,14 +45,14 @@ func TestParseMessage_UserMessage(t *testing.T) {
 }
 
 func TestParseMessage_UserMessage_UUID(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type": "user",
 		"uuid": "test-uuid-123",
 		"message": map[string]any{
 			"role":    "user",
 			"content": "Hello!",
 		},
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -60,7 +70,7 @@ func TestParseMessage_UserMessage_UUID(t *testing.T) {
 }
 
 func TestParseMessage_UserMessage_ToolUseResult(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type": "user",
 		"message": map[string]any{
 			"role":    "user",
@@ -69,7 +79,7 @@ func TestParseMessage_UserMessage_ToolUseResult(t *testing.T) {
 		"tool_use_result": map[string]any{
 			"output": "some output",
 		},
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -91,7 +101,7 @@ func TestParseMessage_UserMessage_ToolUseResult(t *testing.T) {
 }
 
 func TestParseMessage_AssistantMessage(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type": "assistant",
 		"message": map[string]any{
 			"model": "claude-3-opus",
@@ -102,7 +112,7 @@ func TestParseMessage_AssistantMessage(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -133,7 +143,7 @@ func TestParseMessage_AssistantMessage(t *testing.T) {
 }
 
 func TestParseMessage_AssistantMessage_Error(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type":  "assistant",
 		"error": "rate_limit",
 		"message": map[string]any{
@@ -145,7 +155,7 @@ func TestParseMessage_AssistantMessage_Error(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -163,7 +173,7 @@ func TestParseMessage_AssistantMessage_Error(t *testing.T) {
 }
 
 func TestParseMessage_ToolUseBlock(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type": "assistant",
 		"message": map[string]any{
 			"model": "claude-3-opus",
@@ -178,7 +188,7 @@ func TestParseMessage_ToolUseBlock(t *testing.T) {
 				},
 			},
 		},
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -214,7 +224,7 @@ func TestParseMessage_ToolUseBlock(t *testing.T) {
 
 func TestParseMessage_ResultMessage(t *testing.T) {
 	cost := 0.0123
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type":            "result",
 		"subtype":         "success",
 		"duration_ms":     float64(1500),
@@ -223,7 +233,7 @@ func TestParseMessage_ResultMessage(t *testing.T) {
 		"num_turns":       float64(3),
 		"session_id":      "session_abc123",
 		"total_cost_usd":  cost,
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -252,12 +262,52 @@ func TestParseMessage_ResultMessage(t *testing.T) {
 	}
 }
 
+func TestParseMessage_ResultMessage_WithUsage(t *testing.T) {
+	data := mustMarshal(map[string]any{
+		"type":       "result",
+		"subtype":    "success",
+		"session_id": "session_123",
+		"usage": map[string]any{
+			"input_tokens":                float64(100),
+			"output_tokens":               float64(200),
+			"cache_creation_input_tokens": float64(50),
+			"cache_read_input_tokens":     float64(30),
+		},
+	})
+
+	msg, err := ParseMessage(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resultMsg, ok := msg.(*ResultMessage)
+	if !ok {
+		t.Fatalf("expected *ResultMessage, got %T", msg)
+	}
+
+	if resultMsg.Usage == nil {
+		t.Fatal("expected Usage to be set")
+	}
+	if resultMsg.Usage.InputTokens != 100 {
+		t.Errorf("expected InputTokens 100, got %d", resultMsg.Usage.InputTokens)
+	}
+	if resultMsg.Usage.OutputTokens != 200 {
+		t.Errorf("expected OutputTokens 200, got %d", resultMsg.Usage.OutputTokens)
+	}
+	if resultMsg.Usage.CacheCreationInputTokens != 50 {
+		t.Errorf("expected CacheCreationInputTokens 50, got %d", resultMsg.Usage.CacheCreationInputTokens)
+	}
+	if resultMsg.Usage.CacheReadInputTokens != 30 {
+		t.Errorf("expected CacheReadInputTokens 30, got %d", resultMsg.Usage.CacheReadInputTokens)
+	}
+}
+
 func TestParseMessage_SystemMessage(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type":    "system",
 		"subtype": "init",
 		"data":    map[string]any{"version": "1.0.0"},
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -275,9 +325,9 @@ func TestParseMessage_SystemMessage(t *testing.T) {
 }
 
 func TestParseMessage_UnknownType_ReturnsNil(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"type": "unknown_type",
-	}
+	})
 
 	msg, err := ParseMessage(data)
 	if err != nil {
@@ -289,9 +339,9 @@ func TestParseMessage_UnknownType_ReturnsNil(t *testing.T) {
 }
 
 func TestParseMessage_MissingType(t *testing.T) {
-	data := RawMessage{
+	data := mustMarshal(map[string]any{
 		"content": "no type field",
-	}
+	})
 
 	_, err := ParseMessage(data)
 	if err == nil {
@@ -690,7 +740,7 @@ func TestBuildCommand_NoAgentsFlag(t *testing.T) {
 	transport := &SubprocessTransport{
 		options: ClaudeAgentOptions{
 			CLIPath: cliPath,
-			Agents: map[string]AgentDefinition{
+			Agents: map[string]*AgentDefinition{
 				"test": {Description: "test", Prompt: "test"},
 			},
 		},
@@ -763,7 +813,7 @@ func TestProcessError_ErrorMessage_WithoutStderr(t *testing.T) {
 
 func TestSdkMcpServer_AddAndFindTool(t *testing.T) {
 	server := NewSdkMcpServer("test-server", "1.0.0")
-	server.AddTool(SdkMcpTool{
+	server.AddTool(&SdkMcpTool{
 		Name:        "test-tool",
 		Description: "A test tool",
 		Handler: func(args map[string]any) ([]map[string]any, error) {
@@ -856,33 +906,28 @@ func TestHandleSdkMcpRequest_Initialize(t *testing.T) {
 		},
 	}
 
-	response := q.handleSdkMcpRequest("test-server", map[string]any{
-		"method": "initialize",
-		"id":     1,
+	response := q.handleSdkMcpRequest("test-server", &jsonrpcRequest{
+		Method: "initialize",
+		ID:     1,
 	})
 
-	if response["jsonrpc"] != "2.0" {
-		t.Errorf("expected jsonrpc '2.0', got '%v'", response["jsonrpc"])
+	if response.JSONRPC != "2.0" {
+		t.Errorf("expected jsonrpc '2.0', got '%v'", response.JSONRPC)
 	}
 
-	result, ok := response["result"].(map[string]any)
+	result, ok := response.Result.(mcpInitializeResult)
 	if !ok {
-		t.Fatal("expected result in response")
+		t.Fatalf("expected mcpInitializeResult, got %T", response.Result)
 	}
 
-	serverInfo, ok := result["serverInfo"].(map[string]any)
-	if !ok {
-		t.Fatal("expected serverInfo in result")
-	}
-
-	if serverInfo["name"] != "test-server" {
-		t.Errorf("expected server name 'test-server', got '%v'", serverInfo["name"])
+	if result.ServerInfo.Name != "test-server" {
+		t.Errorf("expected server name 'test-server', got '%s'", result.ServerInfo.Name)
 	}
 }
 
 func TestHandleSdkMcpRequest_ToolsList(t *testing.T) {
 	server := NewSdkMcpServer("test-server", "1.0.0")
-	server.AddTool(SdkMcpTool{
+	server.AddTool(&SdkMcpTool{
 		Name:        "my-tool",
 		Description: "My test tool",
 		InputSchema: &jsonschema.Schema{
@@ -899,33 +944,28 @@ func TestHandleSdkMcpRequest_ToolsList(t *testing.T) {
 		},
 	}
 
-	response := q.handleSdkMcpRequest("test-server", map[string]any{
-		"method": "tools/list",
-		"id":     2,
+	response := q.handleSdkMcpRequest("test-server", &jsonrpcRequest{
+		Method: "tools/list",
+		ID:     2,
 	})
 
-	result, ok := response["result"].(map[string]any)
+	result, ok := response.Result.(mcpToolsListResult)
 	if !ok {
-		t.Fatal("expected result in response")
+		t.Fatalf("expected mcpToolsListResult, got %T", response.Result)
 	}
 
-	tools, ok := result["tools"].([]map[string]any)
-	if !ok {
-		t.Fatal("expected tools array in result")
+	if len(result.Tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(result.Tools))
 	}
 
-	if len(tools) != 1 {
-		t.Fatalf("expected 1 tool, got %d", len(tools))
-	}
-
-	if tools[0]["name"] != "my-tool" {
-		t.Errorf("expected tool name 'my-tool', got '%v'", tools[0]["name"])
+	if result.Tools[0].Name != "my-tool" {
+		t.Errorf("expected tool name 'my-tool', got '%s'", result.Tools[0].Name)
 	}
 }
 
 func TestHandleSdkMcpRequest_ToolsCall(t *testing.T) {
 	server := NewSdkMcpServer("test-server", "1.0.0")
-	server.AddTool(SdkMcpTool{
+	server.AddTool(&SdkMcpTool{
 		Name: "greet",
 		Handler: func(args map[string]any) ([]map[string]any, error) {
 			name := fmt.Sprintf("Hello, %v!", args["name"])
@@ -939,31 +979,26 @@ func TestHandleSdkMcpRequest_ToolsCall(t *testing.T) {
 		},
 	}
 
-	response := q.handleSdkMcpRequest("test-server", map[string]any{
-		"method": "tools/call",
-		"id":     3,
-		"params": map[string]any{
-			"name":      "greet",
-			"arguments": map[string]any{"name": "World"},
-		},
+	response := q.handleSdkMcpRequest("test-server", &jsonrpcRequest{
+		Method: "tools/call",
+		ID:     3,
+		Params: mustMarshal(mcpToolsCallParams{
+			Name:      "greet",
+			Arguments: map[string]any{"name": "World"},
+		}),
 	})
 
-	result, ok := response["result"].(map[string]any)
+	result, ok := response.Result.(mcpToolCallResult)
 	if !ok {
-		t.Fatal("expected result in response")
+		t.Fatalf("expected mcpToolCallResult, got %T", response.Result)
 	}
 
-	content, ok := result["content"].([]map[string]any)
-	if !ok {
-		t.Fatal("expected content in result")
+	if len(result.Content) != 1 {
+		t.Fatalf("expected 1 content block, got %d", len(result.Content))
 	}
 
-	if len(content) != 1 {
-		t.Fatalf("expected 1 content block, got %d", len(content))
-	}
-
-	if content[0]["text"] != "Hello, World!" {
-		t.Errorf("expected 'Hello, World!', got '%v'", content[0]["text"])
+	if result.Content[0]["text"] != "Hello, World!" {
+		t.Errorf("expected 'Hello, World!', got '%v'", result.Content[0]["text"])
 	}
 }
 
@@ -972,12 +1007,12 @@ func TestHandleSdkMcpRequest_ServerNotFound(t *testing.T) {
 		sdkMcpServers: map[string]*SdkMcpServer{},
 	}
 
-	response := q.handleSdkMcpRequest("nonexistent", map[string]any{
-		"method": "initialize",
-		"id":     1,
+	response := q.handleSdkMcpRequest("nonexistent", &jsonrpcRequest{
+		Method: "initialize",
+		ID:     1,
 	})
 
-	if response["error"] == nil {
+	if response.Error == nil {
 		t.Error("expected error for nonexistent server")
 	}
 }

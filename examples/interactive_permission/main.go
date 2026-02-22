@@ -81,12 +81,12 @@ func interactivePermissionExample(ctx context.Context) {
 
 		if allowed {
 			fmt.Println("✓ Permission GRANTED")
-			return claude.PermissionResultAllow{Behavior: "allow"}, nil
+			return claude.PermissionResultAllow{Behavior: claude.PermissionBehaviorAllow}, nil
 		}
 
 		fmt.Println("✗ Permission DENIED")
 		return claude.PermissionResultDeny{
-			Behavior: "deny",
+			Behavior: claude.PermissionBehaviorDeny,
 			Message:  fmt.Sprintf("User denied permission for tool: %s", toolName),
 		}, nil
 	}

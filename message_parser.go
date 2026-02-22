@@ -1,27 +1,84 @@
 package claudeagent
 
-// ParseMessage parses a raw message from CLI output into a typed Message.
+import (
+	"encoding/json"
+)
+
+// Wire format structs for parsing CLI messages.
+
+// userMessageWire is the wire format for user messages from the CLI.
+type userMessageWire struct {
+	UUID            string         `json:"uuid,omitempty"`
+	ParentToolUseID string         `json:"parent_tool_use_id,omitempty"`
+	ToolUseResult   map[string]any `json:"tool_use_result,omitempty"`
+	Message         struct {
+		Content json.RawMessage `json:"content"`
+	} `json:"message"`
+}
+
+// assistantMessageWire is the wire format for assistant messages from the CLI.
+type assistantMessageWire struct {
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	Error           string `json:"error,omitempty"`
+	Message         struct {
+		Model   string          `json:"model,omitempty"`
+		Content json.RawMessage `json:"content"`
+	} `json:"message"`
+}
+
+// systemMessageWire is the wire format for system messages from the CLI.
+type systemMessageWire struct {
+	Subtype string `json:"subtype"`
+}
+
+// streamEventWire is the wire format for stream_event messages from the CLI.
+type streamEventWire struct {
+	UUID            string         `json:"uuid"`
+	SessionID       string         `json:"session_id"`
+	Event           map[string]any `json:"event"`
+	ParentToolUseID string         `json:"parent_tool_use_id,omitempty"`
+}
+
+// contentBlockWire is a unified wire format for all content block types.
+type contentBlockWire struct {
+	Type      ContentBlockType `json:"type"`
+	Text      string           `json:"text,omitempty"`
+	Thinking  string           `json:"thinking,omitempty"`
+	Signature string           `json:"signature,omitempty"`
+	ID        string           `json:"id,omitempty"`
+	Name      string           `json:"name,omitempty"`
+	Input     map[string]any   `json:"input,omitempty"`
+	ToolUseID string           `json:"tool_use_id,omitempty"`
+	Content   any              `json:"content,omitempty"`
+	IsError   *bool            `json:"is_error,omitempty"`
+}
+
+// ParseMessage parses a raw JSON message from CLI output into a typed Message.
 // Returns nil, nil for unknown message types (forward-compatible).
-func ParseMessage(data RawMessage) (Message, error) {
-	if data == nil {
+func ParseMessage(data json.RawMessage) (Message, error) {
+	if len(data) == 0 {
 		return nil, NewMessageParseError("message data is nil", data)
 	}
 
-	msgType, ok := data["type"].(string)
-	if !ok {
+	var envelope messageEnvelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, NewMessageParseError("failed to parse message envelope", data)
+	}
+
+	if envelope.Type == "" {
 		return nil, NewMessageParseError("message missing 'type' field", data)
 	}
 
-	switch msgType {
-	case "user":
+	switch envelope.Type {
+	case MessageTypeUser:
 		return parseUserMessage(data)
-	case "assistant":
+	case MessageTypeAssistant:
 		return parseAssistantMessage(data)
-	case "system":
+	case MessageTypeSystem:
 		return parseSystemMessage(data)
-	case "result":
+	case MessageTypeResult:
 		return parseResultMessage(data)
-	case "stream_event":
+	case MessageTypeStreamEvent:
 		return parseStreamEvent(data)
 	default:
 		// Forward-compatible: skip unrecognized message types so newer
@@ -30,36 +87,33 @@ func ParseMessage(data RawMessage) (Message, error) {
 	}
 }
 
-func parseUserMessage(data RawMessage) (*UserMessage, error) {
-	msg := &UserMessage{}
-
-	// Get parent_tool_use_id
-	if parentID, ok := data["parent_tool_use_id"].(string); ok {
-		msg.ParentToolUseID = parentID
+func parseUserMessage(data json.RawMessage) (*UserMessage, error) {
+	var wire userMessageWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, NewMessageParseError("failed to parse user message", data)
 	}
 
-	// Get uuid
-	if uuid, ok := data["uuid"].(string); ok {
-		msg.UUID = uuid
-	}
-
-	// Get tool_use_result
-	if tur, ok := data["tool_use_result"].(map[string]any); ok {
-		msg.ToolUseResult = tur
-	}
-
-	// Get message content
-	messageData, ok := data["message"].(map[string]any)
-	if !ok {
+	if wire.Message.Content == nil {
 		return nil, NewMessageParseError("user message missing 'message' field", data)
 	}
 
-	content := messageData["content"]
+	msg := &UserMessage{
+		UUID:            wire.UUID,
+		ParentToolUseID: wire.ParentToolUseID,
+		ToolUseResult:   wire.ToolUseResult,
+	}
+
+	// Content can be a string or an array of content blocks.
+	var content any
+	if err := json.Unmarshal(wire.Message.Content, &content); err != nil {
+		return nil, NewMessageParseError("failed to parse user message content", data)
+	}
+
 	switch c := content.(type) {
 	case string:
 		msg.Content = c
 	case []any:
-		blocks, err := parseContentBlocks(c)
+		blocks, err := parseContentBlocksFromRaw(wire.Message.Content)
 		if err != nil {
 			return nil, err
 		}
@@ -71,188 +125,119 @@ func parseUserMessage(data RawMessage) (*UserMessage, error) {
 	return msg, nil
 }
 
-func parseAssistantMessage(data RawMessage) (*AssistantMessage, error) {
-	msg := &AssistantMessage{}
-
-	// Get parent_tool_use_id
-	if parentID, ok := data["parent_tool_use_id"].(string); ok {
-		msg.ParentToolUseID = parentID
+func parseAssistantMessage(data json.RawMessage) (*AssistantMessage, error) {
+	var wire assistantMessageWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, NewMessageParseError("failed to parse assistant message", data)
 	}
 
-	// Get error field
-	if errStr, ok := data["error"].(string); ok {
-		msg.Error = AssistantMessageError(errStr)
-	}
-
-	// Get message data
-	messageData, ok := data["message"].(map[string]any)
-	if !ok {
-		return nil, NewMessageParseError("assistant message missing 'message' field", data)
-	}
-
-	// Get model
-	if model, ok := messageData["model"].(string); ok {
-		msg.Model = model
-	}
-
-	// Get content blocks
-	contentArr, ok := messageData["content"].([]any)
-	if !ok {
+	if wire.Message.Content == nil {
 		return nil, NewMessageParseError("assistant message missing 'content' field", data)
 	}
 
-	blocks, err := parseContentBlocks(contentArr)
+	blocks, err := parseContentBlocksFromRaw(wire.Message.Content)
 	if err != nil {
-		return nil, err
+		return nil, NewMessageParseError("failed to parse assistant content blocks", data)
 	}
-	msg.Content = blocks
 
-	return msg, nil
+	return &AssistantMessage{
+		ParentToolUseID: wire.ParentToolUseID,
+		Error:           AssistantMessageError(wire.Error),
+		Model:           wire.Message.Model,
+		Content:         blocks,
+	}, nil
 }
 
-func parseSystemMessage(data RawMessage) (*SystemMessage, error) {
-	msg := &SystemMessage{
-		Data: data,
+func parseSystemMessage(data json.RawMessage) (*SystemMessage, error) {
+	var wire systemMessageWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, NewMessageParseError("failed to parse system message", data)
 	}
 
-	if subtype, ok := data["subtype"].(string); ok {
-		msg.Subtype = subtype
-	} else {
+	if wire.Subtype == "" {
 		return nil, NewMessageParseError("system message missing 'subtype' field", data)
 	}
 
-	return msg, nil
+	// Keep the full message as Data for backward compatibility.
+	var fullMap map[string]any
+	if err := json.Unmarshal(data, &fullMap); err != nil {
+		return nil, NewMessageParseError("failed to parse system message data", data)
+	}
+
+	return &SystemMessage{
+		Subtype: wire.Subtype,
+		Data:    fullMap,
+	}, nil
 }
 
-func parseResultMessage(data RawMessage) (*ResultMessage, error) {
+func parseResultMessage(data json.RawMessage) (*ResultMessage, error) {
 	msg := &ResultMessage{}
-
-	if subtype, ok := data["subtype"].(string); ok {
-		msg.Subtype = subtype
-	} else {
+	if err := json.Unmarshal(data, msg); err != nil {
+		return nil, NewMessageParseError("failed to parse result message", data)
+	}
+	if msg.Subtype == "" {
 		return nil, NewMessageParseError("result message missing 'subtype' field", data)
 	}
-
-	if durationMs, ok := data["duration_ms"].(float64); ok {
-		msg.DurationMs = int(durationMs)
-	}
-
-	if durationAPIMs, ok := data["duration_api_ms"].(float64); ok {
-		msg.DurationAPIMs = int(durationAPIMs)
-	}
-
-	if isError, ok := data["is_error"].(bool); ok {
-		msg.IsError = isError
-	}
-
-	if numTurns, ok := data["num_turns"].(float64); ok {
-		msg.NumTurns = int(numTurns)
-	}
-
-	if sessionID, ok := data["session_id"].(string); ok {
-		msg.SessionID = sessionID
-	} else {
+	if msg.SessionID == "" {
 		return nil, NewMessageParseError("result message missing 'session_id' field", data)
 	}
-
-	if totalCost, ok := data["total_cost_usd"].(float64); ok {
-		msg.TotalCostUSD = &totalCost
-	}
-
-	if usage, ok := data["usage"].(map[string]any); ok {
-		msg.Usage = usage
-	}
-
-	if result, ok := data["result"].(string); ok {
-		msg.Result = result
-	}
-
-	if structuredOutput, ok := data["structured_output"]; ok {
-		msg.StructuredOutput = structuredOutput
-	}
-
 	return msg, nil
 }
 
-func parseStreamEvent(data RawMessage) (*StreamEvent, error) {
-	msg := &StreamEvent{}
+func parseStreamEvent(data json.RawMessage) (*StreamEvent, error) {
+	var wire streamEventWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, NewMessageParseError("failed to parse stream_event message", data)
+	}
 
-	if uuid, ok := data["uuid"].(string); ok {
-		msg.UUID = uuid
-	} else {
+	if wire.UUID == "" {
 		return nil, NewMessageParseError("stream_event message missing 'uuid' field", data)
 	}
-
-	if sessionID, ok := data["session_id"].(string); ok {
-		msg.SessionID = sessionID
-	} else {
+	if wire.SessionID == "" {
 		return nil, NewMessageParseError("stream_event message missing 'session_id' field", data)
 	}
-
-	if event, ok := data["event"].(map[string]any); ok {
-		msg.Event = event
-	} else {
+	if wire.Event == nil {
 		return nil, NewMessageParseError("stream_event message missing 'event' field", data)
 	}
 
-	if parentID, ok := data["parent_tool_use_id"].(string); ok {
-		msg.ParentToolUseID = parentID
-	}
-
-	return msg, nil
+	return &StreamEvent{
+		UUID:            wire.UUID,
+		SessionID:       wire.SessionID,
+		Event:           wire.Event,
+		ParentToolUseID: wire.ParentToolUseID,
+	}, nil
 }
 
-func parseContentBlocks(blocks []any) ([]ContentBlock, error) {
+// parseContentBlocksFromRaw parses a JSON array of content blocks.
+func parseContentBlocksFromRaw(data json.RawMessage) ([]ContentBlock, error) {
+	var blocks []contentBlockWire
+	if err := json.Unmarshal(data, &blocks); err != nil {
+		return nil, err
+	}
+
 	result := make([]ContentBlock, 0, len(blocks))
-
-	for _, block := range blocks {
-		blockMap, ok := block.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		blockType, ok := blockMap["type"].(string)
-		if !ok {
-			continue
-		}
-
-		switch blockType {
-		case "text":
-			text, _ := blockMap["text"].(string)
-			result = append(result, TextBlock{Text: text})
-
-		case "thinking":
-			thinking, _ := blockMap["thinking"].(string)
-			signature, _ := blockMap["signature"].(string)
+	for _, b := range blocks {
+		switch b.Type {
+		case ContentBlockTypeText:
+			result = append(result, TextBlock{Text: b.Text})
+		case ContentBlockTypeThinking:
 			result = append(result, ThinkingBlock{
-				Thinking:  thinking,
-				Signature: signature,
+				Thinking:  b.Thinking,
+				Signature: b.Signature,
 			})
-
-		case "tool_use":
-			id, _ := blockMap["id"].(string)
-			name, _ := blockMap["name"].(string)
-			input, _ := blockMap["input"].(map[string]any)
+		case ContentBlockTypeToolUse:
 			result = append(result, ToolUseBlock{
-				ID:    id,
-				Name:  name,
-				Input: input,
+				ID:    b.ID,
+				Name:  b.Name,
+				Input: b.Input,
 			})
-
-		case "tool_result":
-			toolUseID, _ := blockMap["tool_use_id"].(string)
-			content := blockMap["content"]
-			var isError *bool
-			if ie, ok := blockMap["is_error"].(bool); ok {
-				isError = &ie
-			}
+		case ContentBlockTypeToolResult:
 			result = append(result, ToolResultBlock{
-				ToolUseID: toolUseID,
-				Content:   content,
-				IsError:   isError,
+				ToolUseID: b.ToolUseID,
+				Content:   b.Content,
+				IsError:   b.IsError,
 			})
 		}
 	}
-
 	return result, nil
 }

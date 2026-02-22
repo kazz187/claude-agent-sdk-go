@@ -15,6 +15,75 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
+// Wire types for routing and control protocol parsing.
+
+// MessageType represents the type field of a CLI message.
+type MessageType string
+
+const (
+	MessageTypeUser                 MessageType = "user"
+	MessageTypeAssistant            MessageType = "assistant"
+	MessageTypeSystem               MessageType = "system"
+	MessageTypeResult               MessageType = "result"
+	MessageTypeStreamEvent          MessageType = "stream_event"
+	MessageTypeControlResponse      MessageType = "control_response"
+	MessageTypeControlRequest       MessageType = "control_request"
+	MessageTypeControlCancelRequest MessageType = "control_cancel_request"
+)
+
+// MessageRole represents the role field of a message.
+type MessageRole string
+
+const (
+	MessageRoleUser      MessageRole = "user"
+	MessageRoleAssistant MessageRole = "assistant"
+)
+
+// ContentBlockType represents the type field of a content block.
+type ContentBlockType string
+
+const (
+	ContentBlockTypeText       ContentBlockType = "text"
+	ContentBlockTypeThinking   ContentBlockType = "thinking"
+	ContentBlockTypeToolUse    ContentBlockType = "tool_use"
+	ContentBlockTypeToolResult ContentBlockType = "tool_result"
+)
+
+// ControlSubtype represents the subtype field of control protocol messages.
+type ControlSubtype string
+
+const (
+	// Incoming control request subtypes (from CLI)
+	ControlSubtypeCanUseTool   ControlSubtype = "can_use_tool"
+	ControlSubtypeHookCallback ControlSubtype = "hook_callback"
+	ControlSubtypeMcpMessage   ControlSubtype = "mcp_message"
+
+	// Outgoing control request subtypes (to CLI)
+	ControlSubtypeInitialize        ControlSubtype = "initialize"
+	ControlSubtypeInterrupt         ControlSubtype = "interrupt"
+	ControlSubtypeSetPermissionMode ControlSubtype = "set_permission_mode"
+	ControlSubtypeSetModel          ControlSubtype = "set_model"
+	ControlSubtypeMcpStatus         ControlSubtype = "mcp_status"
+	ControlSubtypeRewindFiles       ControlSubtype = "rewind_files"
+
+	// Control response subtypes
+	ControlSubtypeError   ControlSubtype = "error"
+	ControlSubtypeSuccess ControlSubtype = "success"
+)
+
+// messageEnvelope is used to peek at the "type" field for routing.
+type messageEnvelope struct {
+	Type MessageType `json:"type"`
+}
+
+// controlRequestWire is the wire format for incoming control_request messages.
+// Request is kept as json.RawMessage so we can peek at the subtype before
+// unmarshalling into a typed struct.
+type controlRequestWire struct {
+	RequestID string          `json:"request_id"`
+	Request   json.RawMessage `json:"request"`
+}
+
 // Query handles bidirectional control protocol on top of Transport.
 // It manages control request/response routing, hook callbacks,
 // tool permission callbacks, SDK MCP servers, message streaming,
@@ -23,19 +92,19 @@ type Query struct {
 	transport         Transport
 	isStreamingMode   bool
 	canUseTool        CanUseToolFunc
-	hooks             map[HookEvent][]HookMatcher
+	hooks             map[HookEvent][]*HookMatcher
 	sdkMcpServers     map[string]*SdkMcpServer
-	agents            map[string]map[string]any
+	agents            map[string]*AgentDefinition
 	initializeTimeout time.Duration
 
 	// Control protocol state
-	pendingResponses map[string]chan map[string]any
+	pendingResponses map[string]chan *controlResponsePayload
 	hookCallbacks    map[string]HookCallback
 	nextCallbackID   int64
 	requestCounter   int64
 
 	// Message stream
-	messageChan chan RawMessage
+	messageChan chan json.RawMessage
 	errorChan   chan error
 
 	// Track first result for proper stream closure with SDK MCP servers
@@ -49,7 +118,7 @@ type Query struct {
 	mu                   sync.Mutex
 	initialized          bool
 	closed               bool
-	initializationResult map[string]any
+	initializationResult json.RawMessage
 
 	// Context for cancellation
 	ctx    context.Context
@@ -60,9 +129,9 @@ type Query struct {
 // QueryOptions contains options for creating a Query.
 type QueryOptions struct {
 	CanUseTool        CanUseToolFunc
-	Hooks             map[HookEvent][]HookMatcher
+	Hooks             map[HookEvent][]*HookMatcher
 	SdkMcpServers     map[string]*SdkMcpServer
-	Agents            map[string]map[string]any
+	Agents            map[string]*AgentDefinition
 	InitializeTimeout time.Duration
 }
 
@@ -91,9 +160,9 @@ func NewQuery(transport Transport, isStreamingMode bool, options QueryOptions) *
 		sdkMcpServers:      options.SdkMcpServers,
 		agents:             options.Agents,
 		initializeTimeout:  initTimeout,
-		pendingResponses:   make(map[string]chan map[string]any),
+		pendingResponses:   make(map[string]chan *controlResponsePayload),
 		hookCallbacks:      make(map[string]HookCallback),
-		messageChan:        make(chan RawMessage, 100),
+		messageChan:        make(chan json.RawMessage, 100),
 		errorChan:          make(chan error, 1),
 		firstResultChan:    make(chan struct{}),
 		streamCloseTimeout: streamCloseTimeout,
@@ -118,7 +187,7 @@ func (q *Query) Start(ctx context.Context) error {
 }
 
 // readMessages reads messages from transport and routes them.
-func (q *Query) readMessages(ctx context.Context, msgChan <-chan RawMessage, errChan <-chan error) {
+func (q *Query) readMessages(ctx context.Context, msgChan <-chan json.RawMessage, errChan <-chan error) {
 	defer close(q.messageChan)
 
 	for {
@@ -150,19 +219,22 @@ func (q *Query) readMessages(ctx context.Context, msgChan <-chan RawMessage, err
 			}
 			q.mu.Unlock()
 
-			msgType, _ := msg["type"].(string)
+			var envelope messageEnvelope
+			if err := json.Unmarshal(msg, &envelope); err != nil {
+				continue
+			}
 
-			switch msgType {
-			case "control_response":
+			switch envelope.Type {
+			case MessageTypeControlResponse:
 				q.handleControlResponse(msg)
-			case "control_request":
+			case MessageTypeControlRequest:
 				// Handle control request in a separate goroutine to avoid blocking reader
 				go q.handleControlRequest(msg)
-			case "control_cancel_request":
+			case MessageTypeControlCancelRequest:
 				// TODO: Implement cancellation support
 			default:
 				// Track results for proper stream closure
-				if msgType == "result" {
+				if envelope.Type == MessageTypeResult {
 					q.firstResultOnce.Do(func() {
 						close(q.firstResultChan)
 					})
@@ -187,13 +259,12 @@ func (q *Query) failPendingRequests(err error) {
 	defer q.mu.Unlock()
 
 	for requestID, ch := range q.pendingResponses {
-		errResponse := map[string]any{
-			"subtype":    "error",
-			"request_id": requestID,
-			"error":      err.Error(),
-		}
 		select {
-		case ch <- errResponse:
+		case ch <- &controlResponsePayload{
+			Subtype:   ControlSubtypeError,
+			RequestID: requestID,
+			Error:     err.Error(),
+		}:
 		default:
 		}
 		delete(q.pendingResponses, requestID)
@@ -201,74 +272,81 @@ func (q *Query) failPendingRequests(err error) {
 }
 
 // handleControlResponse handles incoming control response from CLI.
-func (q *Query) handleControlResponse(msg RawMessage) {
-	response, _ := msg["response"].(map[string]any)
-	if response == nil {
+func (q *Query) handleControlResponse(msg json.RawMessage) {
+	var wire controlResponseMessage
+	if err := json.Unmarshal(msg, &wire); err != nil {
 		return
 	}
 
-	requestID, _ := response["request_id"].(string)
-	if requestID == "" {
+	if wire.Response.RequestID == "" {
 		return
 	}
 
 	q.mu.Lock()
-	ch, ok := q.pendingResponses[requestID]
+	ch, ok := q.pendingResponses[wire.Response.RequestID]
 	if ok {
-		delete(q.pendingResponses, requestID)
+		delete(q.pendingResponses, wire.Response.RequestID)
 	}
 	q.mu.Unlock()
 
 	if ok && ch != nil {
+		payload := wire.Response
 		select {
-		case ch <- response:
+		case ch <- &payload:
 		default:
 		}
 	}
 }
 
 // handleControlRequest handles incoming control request from CLI.
-func (q *Query) handleControlRequest(msg RawMessage) {
-	requestID, _ := msg["request_id"].(string)
-	requestData, _ := msg["request"].(map[string]any)
-	if requestID == "" || requestData == nil {
+func (q *Query) handleControlRequest(msg json.RawMessage) {
+	var wire controlRequestWire
+	if err := json.Unmarshal(msg, &wire); err != nil {
+		return
+	}
+	if wire.RequestID == "" || wire.Request == nil {
 		return
 	}
 
-	subtype, _ := requestData["subtype"].(string)
+	// Peek at the subtype
+	var envelope subtypeEnvelope
+	if err := json.Unmarshal(wire.Request, &envelope); err != nil {
+		return
+	}
 
-	var responseData map[string]any
+	var responseData any
 	var err error
 
-	switch subtype {
-	case "can_use_tool":
-		responseData, err = q.handleCanUseTool(requestData)
-	case "hook_callback":
-		responseData, err = q.handleHookCallback(requestData)
-	case "mcp_message":
-		responseData, err = q.handleMcpMessage(requestData)
+	switch envelope.Subtype {
+	case ControlSubtypeCanUseTool:
+		responseData, err = q.handleCanUseTool(wire.Request)
+	case ControlSubtypeHookCallback:
+		responseData, err = q.handleHookCallback(wire.Request)
+	case ControlSubtypeMcpMessage:
+		responseData, err = q.handleMcpMessage(wire.Request)
 	default:
-		err = fmt.Errorf("unsupported control request subtype: %s", subtype)
+		err = fmt.Errorf("unsupported control request subtype: %s", envelope.Subtype)
 	}
 
 	// Send response
-	var response map[string]any
+	var response controlResponseMessage
 	if err != nil {
-		response = map[string]any{
-			"type": "control_response",
-			"response": map[string]any{
-				"subtype":    "error",
-				"request_id": requestID,
-				"error":      err.Error(),
+		response = controlResponseMessage{
+			Type: MessageTypeControlResponse,
+			Response: controlResponsePayload{
+				Subtype:   ControlSubtypeError,
+				RequestID: wire.RequestID,
+				Error:     err.Error(),
 			},
 		}
 	} else {
-		response = map[string]any{
-			"type": "control_response",
-			"response": map[string]any{
-				"subtype":    "success",
-				"request_id": requestID,
-				"response":   responseData,
+		rawResponse, _ := json.Marshal(responseData)
+		response = controlResponseMessage{
+			Type: MessageTypeControlResponse,
+			Response: controlResponsePayload{
+				Subtype:   ControlSubtypeSuccess,
+				RequestID: wire.RequestID,
+				Response:  rawResponse,
 			},
 		}
 	}
@@ -278,65 +356,37 @@ func (q *Query) handleControlRequest(msg RawMessage) {
 }
 
 // handleCanUseTool handles tool permission requests.
-func (q *Query) handleCanUseTool(requestData map[string]any) (map[string]any, error) {
+func (q *Query) handleCanUseTool(raw json.RawMessage) (any, error) {
 	if q.canUseTool == nil {
 		return nil, fmt.Errorf("canUseTool callback is not provided")
 	}
 
-	toolName, _ := requestData["tool_name"].(string)
-	input, _ := requestData["input"].(map[string]any)
-	suggestions, _ := requestData["permission_suggestions"].([]any)
-
-	// Convert suggestions
-	var permSuggestions []PermissionUpdate
-	for _, s := range suggestions {
-		if sMap, ok := s.(map[string]any); ok {
-			pu := PermissionUpdate{}
-			if t, ok := sMap["type"].(string); ok {
-				pu.Type = PermissionUpdateType(t)
-			}
-			permSuggestions = append(permSuggestions, pu)
-		}
+	var req canUseToolRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal can_use_tool request: %w", err)
 	}
 
 	ctx := ToolPermissionContext{
 		Signal:      q.ctx,
-		Suggestions: permSuggestions,
+		Suggestions: req.PermissionSuggestions,
 	}
 
-	result, err := q.canUseTool(toolName, input, ctx)
+	result, err := q.canUseTool(req.ToolName, req.Input, ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	switch r := result.(type) {
 	case PermissionResultAllow:
-		responseData := map[string]any{
-			"behavior": "allow",
+		r.Behavior = PermissionBehaviorAllow
+		if r.UpdatedInput == nil {
+			r.UpdatedInput = req.Input
 		}
-		if r.UpdatedInput != nil {
-			responseData["updatedInput"] = r.UpdatedInput
-		} else {
-			responseData["updatedInput"] = input
-		}
-		if len(r.UpdatedPermissions) > 0 {
-			perms := make([]map[string]any, len(r.UpdatedPermissions))
-			for i, p := range r.UpdatedPermissions {
-				perms[i] = p.ToMap()
-			}
-			responseData["updatedPermissions"] = perms
-		}
-		return responseData, nil
+		return r, nil
 
 	case PermissionResultDeny:
-		responseData := map[string]any{
-			"behavior": "deny",
-			"message":  r.Message,
-		}
-		if r.Interrupt {
-			responseData["interrupt"] = true
-		}
-		return responseData, nil
+		r.Behavior = PermissionBehaviorDeny
+		return r, nil
 
 	default:
 		return nil, fmt.Errorf("invalid permission result type")
@@ -344,291 +394,130 @@ func (q *Query) handleCanUseTool(requestData map[string]any) (map[string]any, er
 }
 
 // handleHookCallback handles hook callback requests.
-func (q *Query) handleHookCallback(requestData map[string]any) (map[string]any, error) {
-	callbackID, _ := requestData["callback_id"].(string)
-	inputData, _ := requestData["input"].(map[string]any)
-	toolUseID, _ := requestData["tool_use_id"].(string)
+func (q *Query) handleHookCallback(raw json.RawMessage) (any, error) {
+	var req hookCallbackRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal hook_callback request: %w", err)
+	}
 
 	q.mu.Lock()
-	callback, ok := q.hookCallbacks[callbackID]
+	callback, ok := q.hookCallbacks[req.CallbackID]
 	q.mu.Unlock()
 
 	if !ok {
-		return nil, fmt.Errorf("no hook callback found for ID: %s", callbackID)
-	}
-
-	// Convert input to HookInput
-	input := HookInput{}
-	if v, ok := inputData["session_id"].(string); ok {
-		input.SessionID = v
-	}
-	if v, ok := inputData["transcript_path"].(string); ok {
-		input.TranscriptPath = v
-	}
-	if v, ok := inputData["cwd"].(string); ok {
-		input.Cwd = v
-	}
-	if v, ok := inputData["permission_mode"].(string); ok {
-		input.PermissionMode = v
-	}
-	if v, ok := inputData["hook_event_name"].(string); ok {
-		input.HookEventName = HookEvent(v)
-	}
-	if v, ok := inputData["tool_name"].(string); ok {
-		input.ToolName = v
-	}
-	if v, ok := inputData["tool_input"].(map[string]any); ok {
-		input.ToolInput = v
-	}
-	if v, ok := inputData["tool_response"]; ok {
-		input.ToolResponse = v
-	}
-	if v, ok := inputData["tool_use_id"].(string); ok {
-		input.ToolUseID = v
-	}
-	if v, ok := inputData["error"].(string); ok {
-		input.Error = v
-	}
-	if v, ok := inputData["is_interrupt"].(bool); ok {
-		input.IsInterrupt = v
-	}
-	if v, ok := inputData["prompt"].(string); ok {
-		input.Prompt = v
-	}
-	if v, ok := inputData["stop_hook_active"].(bool); ok {
-		input.StopHookActive = v
-	}
-	if v, ok := inputData["trigger"].(string); ok {
-		input.Trigger = v
-	}
-	if v, ok := inputData["custom_instructions"].(string); ok {
-		input.CustomInstructions = v
-	}
-	if v, ok := inputData["agent_id"].(string); ok {
-		input.AgentID = v
-	}
-	if v, ok := inputData["agent_transcript_path"].(string); ok {
-		input.AgentTranscriptPath = v
-	}
-	if v, ok := inputData["agent_type"].(string); ok {
-		input.AgentType = v
-	}
-	if v, ok := inputData["message"].(string); ok {
-		input.Message = v
-	}
-	if v, ok := inputData["title"].(string); ok {
-		input.Title = v
-	}
-	if v, ok := inputData["notification_type"].(string); ok {
-		input.NotificationType = v
-	}
-	if v, ok := inputData["permission_suggestions"].([]any); ok {
-		input.PermissionSuggestions = v
+		return nil, fmt.Errorf("no hook callback found for ID: %s", req.CallbackID)
 	}
 
 	ctx := HookContext{
 		Signal: q.ctx,
 	}
 
-	output, err := callback(input, toolUseID, ctx)
+	output, err := callback(req.Input, req.ToolUseID, ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert output to map
-	result := make(map[string]any)
-	if output.Async != nil {
-		result["async"] = *output.Async
-	}
-	if output.AsyncTimeout != nil {
-		result["asyncTimeout"] = *output.AsyncTimeout
-	}
-	if output.Continue != nil {
-		result["continue"] = *output.Continue
-	}
-	if output.SuppressOutput {
-		result["suppressOutput"] = true
-	}
-	if output.StopReason != "" {
-		result["stopReason"] = output.StopReason
-	}
-	if output.Decision != "" {
-		result["decision"] = output.Decision
-	}
-	if output.SystemMessage != "" {
-		result["systemMessage"] = output.SystemMessage
-	}
-	if output.Reason != "" {
-		result["reason"] = output.Reason
-	}
-	if output.HookSpecificOutput != nil {
-		result["hookSpecificOutput"] = output.HookSpecificOutput
-	}
-
-	return result, nil
+	return output, nil
 }
 
 // handleMcpMessage handles SDK MCP server requests.
-func (q *Query) handleMcpMessage(requestData map[string]any) (map[string]any, error) {
-	serverName, _ := requestData["server_name"].(string)
-	message, _ := requestData["message"].(map[string]any)
-
-	if serverName == "" || message == nil {
-		return nil, fmt.Errorf("missing server_name or message for MCP request")
+func (q *Query) handleMcpMessage(raw json.RawMessage) (any, error) {
+	var req mcpMessageRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal mcp_message request: %w", err)
 	}
 
-	mcpResponse := q.handleSdkMcpRequest(serverName, message)
-	return map[string]any{"mcp_response": mcpResponse}, nil
+	if req.ServerName == "" {
+		return nil, fmt.Errorf("missing server_name for MCP request")
+	}
+
+	resp := q.handleSdkMcpRequest(req.ServerName, &req.Message)
+	return mcpMessageResponse{McpResponse: resp}, nil
+}
+
+func newJSONRPCResult(id any, result any) *jsonrpcResponse {
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: id, Result: result}
+}
+
+func newJSONRPCError(id any, code int, msg string) *jsonrpcResponse {
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: id, Error: &jsonrpcError{Code: code, Message: msg}}
 }
 
 // handleSdkMcpRequest handles an MCP JSONRPC request for an SDK server.
-func (q *Query) handleSdkMcpRequest(serverName string, message map[string]any) map[string]any {
+func (q *Query) handleSdkMcpRequest(serverName string, req *jsonrpcRequest) *jsonrpcResponse {
 	if q.sdkMcpServers == nil {
-		return map[string]any{
-			"jsonrpc": "2.0",
-			"id":      message["id"],
-			"error": map[string]any{
-				"code":    -32601,
-				"message": fmt.Sprintf("Server '%s' not found", serverName),
-			},
-		}
+		return newJSONRPCError(req.ID, -32601, fmt.Sprintf("Server '%s' not found", serverName))
 	}
 
 	server, ok := q.sdkMcpServers[serverName]
 	if !ok {
-		return map[string]any{
-			"jsonrpc": "2.0",
-			"id":      message["id"],
-			"error": map[string]any{
-				"code":    -32601,
-				"message": fmt.Sprintf("Server '%s' not found", serverName),
-			},
-		}
+		return newJSONRPCError(req.ID, -32601, fmt.Sprintf("Server '%s' not found", serverName))
 	}
 
-	method, _ := message["method"].(string)
-	params, _ := message["params"].(map[string]any)
+	switch req.Method {
+	case jsonrpcMethodInitialize:
+		return newJSONRPCResult(req.ID, mcpInitializeResult{
+			ProtocolVersion: "2024-11-05",
+			Capabilities:    mcpCapabilities{Tools: map[string]any{}},
+			ServerInfo:      mcpServerInfo{Name: server.Name, Version: server.Version},
+		})
 
-	switch method {
-	case "initialize":
-		return map[string]any{
-			"jsonrpc": "2.0",
-			"id":      message["id"],
-			"result": map[string]any{
-				"protocolVersion": "2024-11-05",
-				"capabilities": map[string]any{
-					"tools": map[string]any{},
-				},
-				"serverInfo": map[string]any{
-					"name":    server.Name,
-					"version": server.Version,
-				},
-			},
-		}
-
-	case "tools/list":
+	case jsonrpcMethodToolsList:
 		tools := server.GetTools()
-		toolsData := make([]map[string]any, len(tools))
+		toolsData := make([]mcpToolInfo, len(tools))
 		for i, tool := range tools {
-			toolData := map[string]any{
-				"name": tool.Name,
+			info := mcpToolInfo{
+				Name:        tool.Name,
+				Description: tool.Description,
+				InputSchema: tool.InputSchema,
 			}
-			if tool.Description != "" {
-				toolData["description"] = tool.Description
+			if info.InputSchema == nil {
+				info.InputSchema = &jsonschema.Schema{}
 			}
-			if tool.InputSchema != nil {
-				toolData["inputSchema"] = tool.InputSchema
-			} else {
-				toolData["inputSchema"] = &jsonschema.Schema{}
+			if tool.Annotations != nil && tool.Annotations.hasValue() {
+				info.Annotations = tool.Annotations
 			}
-			if tool.Annotations != nil {
-				annots := map[string]any{}
-				if tool.Annotations.ReadOnlyHint != nil {
-					annots["readOnlyHint"] = *tool.Annotations.ReadOnlyHint
-				}
-				if tool.Annotations.DestructiveHint != nil {
-					annots["destructiveHint"] = *tool.Annotations.DestructiveHint
-				}
-				if tool.Annotations.IdempotentHint != nil {
-					annots["idempotentHint"] = *tool.Annotations.IdempotentHint
-				}
-				if tool.Annotations.OpenWorldHint != nil {
-					annots["openWorldHint"] = *tool.Annotations.OpenWorldHint
-				}
-				if len(annots) > 0 {
-					toolData["annotations"] = annots
-				}
-			}
-			toolsData[i] = toolData
+			toolsData[i] = info
 		}
-		return map[string]any{
-			"jsonrpc": "2.0",
-			"id":      message["id"],
-			"result":  map[string]any{"tools": toolsData},
-		}
+		return newJSONRPCResult(req.ID, mcpToolsListResult{Tools: toolsData})
 
-	case "tools/call":
-		toolName, _ := params["name"].(string)
-		arguments, _ := params["arguments"].(map[string]any)
+	case jsonrpcMethodToolsCall:
+		var params mcpToolsCallParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return newJSONRPCError(req.ID, -32602, "invalid params for tools/call")
+		}
+		toolName := params.Name
+		arguments := params.Arguments
 
 		tool := server.FindTool(toolName)
 		if tool == nil {
-			return map[string]any{
-				"jsonrpc": "2.0",
-				"id":      message["id"],
-				"error": map[string]any{
-					"code":    -32601,
-					"message": fmt.Sprintf("Tool '%s' not found", toolName),
-				},
-			}
+			return newJSONRPCError(req.ID, -32601, fmt.Sprintf("Tool '%s' not found", toolName))
 		}
 
 		if tool.Handler == nil {
-			return map[string]any{
-				"jsonrpc": "2.0",
-				"id":      message["id"],
-				"error": map[string]any{
-					"code":    -32603,
-					"message": fmt.Sprintf("Tool '%s' has no handler", toolName),
-				},
-			}
+			return newJSONRPCError(req.ID, -32603, fmt.Sprintf("Tool '%s' has no handler", toolName))
 		}
 
 		content, err := tool.Handler(arguments)
 		if err != nil {
-			return map[string]any{
-				"jsonrpc": "2.0",
-				"id":      message["id"],
-				"result": map[string]any{
-					"content":  []map[string]any{{"type": "text", "text": err.Error()}},
-					"is_error": true,
-				},
-			}
+			return newJSONRPCResult(req.ID, mcpToolCallResult{
+				Content: []map[string]any{{"type": "text", "text": err.Error()}},
+				IsError: true,
+			})
 		}
 
-		return map[string]any{
-			"jsonrpc": "2.0",
-			"id":      message["id"],
-			"result":  map[string]any{"content": content},
-		}
+		return newJSONRPCResult(req.ID, mcpToolCallResult{Content: content})
 
-	case "notifications/initialized":
-		return map[string]any{"jsonrpc": "2.0", "result": map[string]any{}}
+	case jsonrpcMethodNotificationsInitialized:
+		return newJSONRPCResult(nil, struct{}{})
 
 	default:
-		return map[string]any{
-			"jsonrpc": "2.0",
-			"id":      message["id"],
-			"error": map[string]any{
-				"code":    -32601,
-				"message": fmt.Sprintf("Method '%s' not found", method),
-			},
-		}
+		return newJSONRPCError(req.ID, -32601, fmt.Sprintf("Method '%s' not found", req.Method))
 	}
 }
 
 // sendControlRequest sends a control request to CLI and waits for response.
-func (q *Query) sendControlRequest(request map[string]any, timeout time.Duration) (map[string]any, error) {
+func (q *Query) sendControlRequest(request any, timeout time.Duration) (json.RawMessage, error) {
 	if !q.isStreamingMode {
 		return nil, fmt.Errorf("control requests require streaming mode")
 	}
@@ -640,16 +529,16 @@ func (q *Query) sendControlRequest(request map[string]any, timeout time.Duration
 	requestID := fmt.Sprintf("req_%d_%s", counter, hex.EncodeToString(randBytes))
 
 	// Create response channel
-	responseChan := make(chan map[string]any, 1)
+	responseChan := make(chan *controlResponsePayload, 1)
 	q.mu.Lock()
 	q.pendingResponses[requestID] = responseChan
 	q.mu.Unlock()
 
 	// Build and send request
-	controlRequest := map[string]any{
-		"type":       "control_request",
-		"request_id": requestID,
-		"request":    request,
+	controlRequest := controlRequestMessage{
+		Type:      MessageTypeControlRequest,
+		RequestID: requestID,
+		Request:   request,
 	}
 
 	data, err := json.Marshal(controlRequest)
@@ -672,38 +561,35 @@ func (q *Query) sendControlRequest(request map[string]any, timeout time.Duration
 	defer cancel()
 
 	select {
-	case response := <-responseChan:
-		subtype, _ := response["subtype"].(string)
-		if subtype == "error" {
-			errMsg, _ := response["error"].(string)
-			return nil, fmt.Errorf("control request error: %s", errMsg)
+	case payload := <-responseChan:
+		if payload.Subtype == ControlSubtypeError {
+			return nil, fmt.Errorf("control request error: %s", payload.Error)
 		}
-		responseData, _ := response["response"].(map[string]any)
-		return responseData, nil
+		return payload.Response, nil
 
 	case <-ctx.Done():
 		q.mu.Lock()
 		delete(q.pendingResponses, requestID)
 		q.mu.Unlock()
-		return nil, fmt.Errorf("control request timeout: %v", request["subtype"])
+		return nil, fmt.Errorf("control request timeout")
 	}
 }
 
 // Initialize initializes the control protocol if in streaming mode.
-func (q *Query) Initialize() (map[string]any, error) {
+func (q *Query) Initialize() (json.RawMessage, error) {
 	if !q.isStreamingMode {
 		return nil, nil
 	}
 
 	// Build hooks configuration for initialization
-	hooksConfig := make(map[string]any)
+	hooksConfig := make(map[string][]hookMatcherConfig)
 	if q.hooks != nil {
 		for event, matchers := range q.hooks {
 			if len(matchers) == 0 {
 				continue
 			}
 
-			matcherConfigs := make([]map[string]any, 0, len(matchers))
+			configs := make([]hookMatcherConfig, 0, len(matchers))
 			for _, matcher := range matchers {
 				callbackIDs := make([]string, 0, len(matcher.Hooks))
 				for _, callback := range matcher.Hooks {
@@ -714,33 +600,25 @@ func (q *Query) Initialize() (map[string]any, error) {
 					callbackIDs = append(callbackIDs, callbackID)
 				}
 
-				matcherConfig := map[string]any{
-					"matcher":         matcher.Matcher,
-					"hookCallbackIds": callbackIDs,
-				}
-				if matcher.Timeout > 0 {
-					matcherConfig["timeout"] = matcher.Timeout
-				}
-				matcherConfigs = append(matcherConfigs, matcherConfig)
+				configs = append(configs, hookMatcherConfig{
+					Matcher:         matcher.Matcher,
+					HookCallbackIDs: callbackIDs,
+					Timeout:         matcher.Timeout,
+				})
 			}
-			hooksConfig[string(event)] = matcherConfigs
+			hooksConfig[string(event)] = configs
 		}
 	}
 
-	// Send initialize request
-	request := map[string]any{
-		"subtype": "initialize",
-	}
-	if len(hooksConfig) > 0 {
-		request["hooks"] = hooksConfig
-	} else {
-		request["hooks"] = nil
+	req := initializeRequest{
+		Subtype: ControlSubtypeInitialize,
+		Hooks:   hooksConfig,
 	}
 	if q.agents != nil {
-		request["agents"] = q.agents
+		req.Agents = q.agents
 	}
 
-	response, err := q.sendControlRequest(request, q.initializeTimeout)
+	response, err := q.sendControlRequest(req, q.initializeTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -755,50 +633,48 @@ func (q *Query) Initialize() (map[string]any, error) {
 
 // Interrupt sends an interrupt control request.
 func (q *Query) Interrupt() error {
-	_, err := q.sendControlRequest(map[string]any{"subtype": "interrupt"}, 60*time.Second)
+	_, err := q.sendControlRequest(interruptRequest{Subtype: ControlSubtypeInterrupt}, 60*time.Second)
 	return err
 }
 
 // SetPermissionMode changes the permission mode.
 func (q *Query) SetPermissionMode(mode string) error {
-	_, err := q.sendControlRequest(map[string]any{
-		"subtype": "set_permission_mode",
-		"mode":    mode,
+	_, err := q.sendControlRequest(setPermissionModeRequest{
+		Subtype: ControlSubtypeSetPermissionMode,
+		Mode:    mode,
 	}, 60*time.Second)
 	return err
 }
 
 // SetModel changes the AI model. Pass nil to use default.
 func (q *Query) SetModel(model *string) error {
-	request := map[string]any{
-		"subtype": "set_model",
-	}
+	var m any
 	if model != nil {
-		request["model"] = *model
-	} else {
-		// Explicitly send null to reset to default
-		request["model"] = nil
+		m = *model
 	}
-	_, err := q.sendControlRequest(request, 60*time.Second)
+	_, err := q.sendControlRequest(setModelRequest{
+		Subtype: ControlSubtypeSetModel,
+		Model:   m,
+	}, 60*time.Second)
 	return err
 }
 
 // GetMcpStatus gets current MCP server connection status.
-func (q *Query) GetMcpStatus() (map[string]any, error) {
-	return q.sendControlRequest(map[string]any{"subtype": "mcp_status"}, 60*time.Second)
+func (q *Query) GetMcpStatus() (json.RawMessage, error) {
+	return q.sendControlRequest(mcpStatusRequest{Subtype: ControlSubtypeMcpStatus}, 60*time.Second)
 }
 
 // RewindFiles rewinds tracked files to their state at a specific user message.
 func (q *Query) RewindFiles(userMessageID string) error {
-	_, err := q.sendControlRequest(map[string]any{
-		"subtype":         "rewind_files",
-		"user_message_id": userMessageID,
+	_, err := q.sendControlRequest(rewindFilesRequest{
+		Subtype:       ControlSubtypeRewindFiles,
+		UserMessageID: userMessageID,
 	}, 60*time.Second)
 	return err
 }
 
 // ReceiveMessages returns a channel for receiving SDK messages.
-func (q *Query) ReceiveMessages() <-chan RawMessage {
+func (q *Query) ReceiveMessages() <-chan json.RawMessage {
 	return q.messageChan
 }
 
@@ -808,7 +684,7 @@ func (q *Query) Errors() <-chan error {
 }
 
 // GetInitializationResult returns the initialization result.
-func (q *Query) GetInitializationResult() map[string]any {
+func (q *Query) GetInitializationResult() json.RawMessage {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.initializationResult

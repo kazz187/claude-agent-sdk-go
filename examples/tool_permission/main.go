@@ -29,7 +29,7 @@ func toolPermissionExample(ctx context.Context) {
 		case "Read":
 			fmt.Println("  Decision: Allow (Read is always allowed)")
 			return claude.PermissionResultAllow{
-				Behavior: "allow",
+				Behavior: claude.PermissionBehaviorAllow,
 			}, nil
 
 		case "Write":
@@ -38,13 +38,13 @@ func toolPermissionExample(ctx context.Context) {
 				if strings.HasPrefix(path, "/tmp/") {
 					fmt.Println("  Decision: Allow (writing to /tmp)")
 					return claude.PermissionResultAllow{
-						Behavior: "allow",
+						Behavior: claude.PermissionBehaviorAllow,
 					}, nil
 				}
 			}
 			fmt.Println("  Decision: Deny (writing outside /tmp not allowed)")
 			return claude.PermissionResultDeny{
-				Behavior: "deny",
+				Behavior: claude.PermissionBehaviorDeny,
 				Message:  "Writing files outside /tmp is not allowed",
 			}, nil
 
@@ -57,26 +57,26 @@ func toolPermissionExample(ctx context.Context) {
 					if strings.Contains(cmd, d) {
 						fmt.Printf("  Decision: Deny (dangerous command: %s)\n", d)
 						return claude.PermissionResultDeny{
-							Behavior: "deny",
+							Behavior: claude.PermissionBehaviorDeny,
 							Message:  fmt.Sprintf("Command contains dangerous pattern: %s", d),
 						}, nil
 					}
 				}
 				fmt.Println("  Decision: Allow (command appears safe)")
 				return claude.PermissionResultAllow{
-					Behavior: "allow",
+					Behavior: claude.PermissionBehaviorAllow,
 				}, nil
 			}
 
 		default:
 			fmt.Printf("  Decision: Allow (tool %s is allowed by default)\n", toolName)
 			return claude.PermissionResultAllow{
-				Behavior: "allow",
+				Behavior: claude.PermissionBehaviorAllow,
 			}, nil
 		}
 
 		return claude.PermissionResultAllow{
-			Behavior: "allow",
+			Behavior: claude.PermissionBehaviorAllow,
 		}, nil
 	}
 

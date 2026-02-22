@@ -279,22 +279,20 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 
 	// MCP servers (strip SDK server instances before passing to CLI)
 	if len(t.options.McpServers) > 0 {
-		serversForCLI := make(map[string]any)
+		serversForCLI := make(map[string]*McpServerConfig)
 		for name, config := range t.options.McpServers {
 			if config.Type == McpServerTypeSDK {
-				// For SDK servers, pass everything except what can't be serialized
-				sdkConfig := map[string]any{
-					"type": string(config.Type),
-					"name": config.Name,
+				// For SDK servers, only pass type and name
+				serversForCLI[name] = &McpServerConfig{
+					Type: config.Type,
+					Name: config.Name,
 				}
-				serversForCLI[name] = sdkConfig
 			} else {
 				serversForCLI[name] = config
 			}
 		}
 		if len(serversForCLI) > 0 {
-			mcpConfig := map[string]any{"mcpServers": serversForCLI}
-			data, err := json.Marshal(mcpConfig)
+			data, err := json.Marshal(mcpServersConfig{McpServers: serversForCLI})
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal MCP config: %w", err)
 			}
@@ -523,8 +521,8 @@ func (t *SubprocessTransport) Write(ctx context.Context, data string) error {
 }
 
 // ReadMessages returns channels for messages and errors.
-func (t *SubprocessTransport) ReadMessages(ctx context.Context) (<-chan RawMessage, <-chan error) {
-	msgChan := make(chan RawMessage, 100)
+func (t *SubprocessTransport) ReadMessages(ctx context.Context) (<-chan json.RawMessage, <-chan error) {
+	msgChan := make(chan json.RawMessage, 100)
 	errChan := make(chan error, 1)
 
 	go func() {
@@ -566,16 +564,16 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) (<-chan RawMessa
 				continue
 			}
 
-			var msg RawMessage
-			if err := json.Unmarshal([]byte(jsonBuffer.String()), &msg); err == nil {
+			raw := []byte(jsonBuffer.String())
+			if json.Valid(raw) {
 				jsonBuffer.Reset()
 				select {
-				case msgChan <- msg:
+				case msgChan <- json.RawMessage(raw):
 				case <-ctx.Done():
 					return
 				}
 			}
-			// If JSON parse fails, keep accumulating (speculative parsing)
+			// If JSON is not valid yet, keep accumulating (speculative parsing)
 		}
 
 		if err := scanner.Err(); err != nil {

@@ -48,7 +48,7 @@ func NewClaudeSDKClientWithTransport(options *ClaudeAgentOptions, transport Tran
 }
 
 // convertHooksToInternalFormat converts HookMatcher format to internal Query format.
-func (c *ClaudeSDKClient) convertHooksToInternalFormat(hooks map[HookEvent][]HookMatcher) map[HookEvent][]HookMatcher {
+func (c *ClaudeSDKClient) convertHooksToInternalFormat(hooks map[HookEvent][]*HookMatcher) map[HookEvent][]*HookMatcher {
 	// Hooks are already in the correct format
 	return hooks
 }
@@ -113,25 +113,6 @@ func (c *ClaudeSDKClient) ConnectWithPrompt(ctx context.Context, prompt string) 
 		}
 	}
 
-	// Convert agents to dict format for initialize request
-	var agentsDict map[string]map[string]any
-	if opts.Agents != nil {
-		agentsDict = make(map[string]map[string]any)
-		for name, agent := range opts.Agents {
-			agentMap := map[string]any{
-				"description": agent.Description,
-				"prompt":      agent.Prompt,
-			}
-			if len(agent.Tools) > 0 {
-				agentMap["tools"] = agent.Tools
-			}
-			if agent.Model != "" {
-				agentMap["model"] = agent.Model
-			}
-			agentsDict[name] = agentMap
-		}
-	}
-
 	// Calculate initialize timeout from env var if set
 	initTimeout := 60 * time.Second
 	if timeoutStr := os.Getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"); timeoutStr != "" {
@@ -149,7 +130,7 @@ func (c *ClaudeSDKClient) ConnectWithPrompt(ctx context.Context, prompt string) 
 		CanUseTool:        opts.CanUseTool,
 		Hooks:             c.convertHooksToInternalFormat(opts.Hooks),
 		SdkMcpServers:     sdkMcpServers,
-		Agents:            agentsDict,
+		Agents:            opts.Agents,
 		InitializeTimeout: initTimeout,
 	})
 
@@ -255,14 +236,13 @@ func (c *ClaudeSDKClient) SendQueryWithSessionID(ctx context.Context, prompt str
 		return ErrNotConnected
 	}
 
-	message := map[string]any{
-		"type": "user",
-		"message": map[string]any{
-			"role":    "user",
-			"content": prompt,
+	message := userInputMessage{
+		Type: MessageTypeUser,
+		Message: userInputContent{
+			Role:    MessageRoleUser,
+			Content: prompt,
 		},
-		"parent_tool_use_id": nil,
-		"session_id":         sessionID,
+		SessionID: sessionID,
 	}
 
 	data, err := json.Marshal(message)
@@ -341,7 +321,7 @@ func (c *ClaudeSDKClient) RewindFiles(ctx context.Context, userMessageID string)
 }
 
 // GetMcpStatus gets current MCP server connection status.
-func (c *ClaudeSDKClient) GetMcpStatus(ctx context.Context) (map[string]any, error) {
+func (c *ClaudeSDKClient) GetMcpStatus(ctx context.Context) (json.RawMessage, error) {
 	c.mu.Lock()
 	query := c.query
 	c.mu.Unlock()
@@ -354,7 +334,7 @@ func (c *ClaudeSDKClient) GetMcpStatus(ctx context.Context) (map[string]any, err
 }
 
 // GetServerInfo returns server initialization info including available commands.
-func (c *ClaudeSDKClient) GetServerInfo() map[string]any {
+func (c *ClaudeSDKClient) GetServerInfo() json.RawMessage {
 	c.mu.Lock()
 	query := c.query
 	c.mu.Unlock()

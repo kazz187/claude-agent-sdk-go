@@ -2,6 +2,7 @@ package claudeagent
 
 import (
 	"context"
+	"encoding/json"
 )
 
 // Transport defines the interface for communication with Claude.
@@ -22,9 +23,9 @@ type Transport interface {
 	// The data is typically JSON followed by a newline.
 	Write(ctx context.Context, data string) error
 
-	// ReadMessages returns a channel that yields parsed JSON messages from the transport.
+	// ReadMessages returns a channel that yields raw JSON messages from the transport.
 	// The channel is closed when the transport is closed or an error occurs.
-	ReadMessages(ctx context.Context) (<-chan RawMessage, <-chan error)
+	ReadMessages(ctx context.Context) (<-chan json.RawMessage, <-chan error)
 
 	// Close closes the transport connection and cleans up resources.
 	Close() error

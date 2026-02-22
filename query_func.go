@@ -53,25 +53,6 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 		// Extract SDK MCP servers
 		sdkMcpServers := make(map[string]*SdkMcpServer)
 
-		// Convert agents to dict format
-		var agentsDict map[string]map[string]any
-		if opts.Agents != nil {
-			agentsDict = make(map[string]map[string]any)
-			for name, agent := range opts.Agents {
-				agentMap := map[string]any{
-					"description": agent.Description,
-					"prompt":      agent.Prompt,
-				}
-				if len(agent.Tools) > 0 {
-					agentMap["tools"] = agent.Tools
-				}
-				if agent.Model != "" {
-					agentMap["model"] = agent.Model
-				}
-				agentsDict[name] = agentMap
-			}
-		}
-
 		// Calculate initialize timeout
 		initTimeout := 60 * time.Second
 		if timeoutStr := os.Getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"); timeoutStr != "" {
@@ -88,7 +69,7 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 			CanUseTool:        opts.CanUseTool,
 			Hooks:             opts.Hooks,
 			SdkMcpServers:     sdkMcpServers,
-			Agents:            agentsDict,
+			Agents:            opts.Agents,
 			InitializeTimeout: initTimeout,
 		})
 
@@ -106,14 +87,13 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 		}
 
 		// Send the user message via stdin
-		message := map[string]any{
-			"type": "user",
-			"message": map[string]any{
-				"role":    "user",
-				"content": prompt,
+		message := userInputMessage{
+			Type: MessageTypeUser,
+			Message: userInputContent{
+				Role:    MessageRoleUser,
+				Content: prompt,
 			},
-			"parent_tool_use_id": nil,
-			"session_id":         "default",
+			SessionID: "default",
 		}
 
 		data, err := json.Marshal(message)
