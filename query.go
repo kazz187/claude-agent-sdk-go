@@ -177,11 +177,9 @@ func NewQuery(transport Transport, isStreamingMode bool, options QueryOptions) *
 func (q *Query) Start(ctx context.Context) error {
 	msgChan, errChan := q.transport.ReadMessages(ctx)
 
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
+	q.wg.Go(func() {
 		q.readMessages(ctx, msgChan, errChan)
-	}()
+	})
 
 	return nil
 }

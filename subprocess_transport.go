@@ -693,7 +693,7 @@ func compareVersions(a, b string) int {
 	partsA := strings.Split(a, ".")
 	partsB := strings.Split(b, ".")
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		var numA, numB int
 		if i < len(partsA) {
 			numA, _ = strconv.Atoi(partsA[i])
