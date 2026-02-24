@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
+	"time"
 )
 
 const (
@@ -432,6 +432,7 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 	}
 
 	t.cmd = exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+	setProcGroup(t.cmd)
 	t.cmd.Env = env
 	if t.options.Cwd != "" {
 		t.cmd.Dir = t.options.Cwd
@@ -621,10 +622,19 @@ func (t *SubprocessTransport) Close() error {
 		t.stderr = nil
 	}
 
-	// Terminate process with SIGTERM (graceful shutdown)
+	// Terminate entire process group (including grandchildren spawned by Claude's Task tool)
 	if t.cmd != nil && t.cmd.Process != nil {
-		t.cmd.Process.Signal(syscall.SIGTERM)
-		t.cmd.Wait()
+		killProcessGroup(t.cmd.Process.Pid)
+
+		// Wait with timeout — SIGKILL fallback
+		done := make(chan error, 1)
+		go func() { done <- t.cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			forceKillProcessGroup(t.cmd.Process.Pid)
+			<-done
+		}
 	}
 
 	// Close stdout
