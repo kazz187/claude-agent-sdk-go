@@ -107,10 +107,12 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 			return
 		}
 
-		// If we have SDK MCP servers or hooks, wait for first result before ending input
+		// If we have SDK MCP servers, hooks, or CanUseTool callback, wait for first result
+		// before ending input. CanUseTool needs stdin open for control protocol responses.
 		hasHooks := len(opts.Hooks) > 0
 		hasSdkMcp := len(sdkMcpServers) > 0
-		if hasSdkMcp || hasHooks {
+		hasCanUseTool := opts.CanUseTool != nil
+		if hasSdkMcp || hasHooks || hasCanUseTool {
 			// Let StreamInput handle the wait
 			go func() {
 				streamCloseTimeout := 60 * time.Second
@@ -192,6 +194,11 @@ func RunQuerySync(ctx context.Context, prompt string, options *ClaudeAgentOption
 			return result, ctx.Err()
 		case err, ok := <-errChan:
 			if ok && err != nil {
+				// MessageParseError is non-fatal: skip unparseable messages
+				// (e.g. user messages echoed back in a newer CLI format).
+				if _, isParseErr := err.(*MessageParseError); isParseErr {
+					continue
+				}
 				return result, err
 			}
 		case msg, ok := <-msgChan:
