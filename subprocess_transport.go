@@ -2,6 +2,7 @@ package claudeagent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -678,16 +679,48 @@ func (t *SubprocessTransport) checkClaudeVersion(ctx context.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 2*1e9) // 2 seconds
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, cliPath, "-v")
-	output, err := cmd.Output()
-	if err != nil {
+	// Do NOT use exec.CommandContext here — its SIGKILL only targets the
+	// main process.  If the Node.js CLI spawns children that inherit the
+	// stdout pipe, cmd.Output()/cmd.Wait() will block until those children
+	// exit.  Instead we manage the process group ourselves so we can kill
+	// the entire tree on timeout.
+	cmd := exec.Command(cliPath, "-v")
+	setProcGroup(cmd) // Setsid: new session + process group
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Start(); err != nil {
 		return
 	}
 
-	versionStr := strings.TrimSpace(string(output))
+	// Wait for the process in a goroutine so we can enforce the timeout.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return
+		}
+	case <-timeoutCtx.Done():
+		// Timeout: kill the entire process group and wait for cleanup.
+		killProcessGroup(cmd.Process.Pid)
+		waitDone := make(chan struct{})
+		go func() { <-done; close(waitDone) }()
+		select {
+		case <-waitDone:
+		case <-time.After(2 * time.Second):
+			forceKillProcessGroup(cmd.Process.Pid)
+			<-done
+		}
+		return
+	}
+
+	versionStr := strings.TrimSpace(stdout.String())
 	re := regexp.MustCompile(`([0-9]+\.[0-9]+\.[0-9]+)`)
 	match := re.FindStringSubmatch(versionStr)
 	if len(match) < 2 {
