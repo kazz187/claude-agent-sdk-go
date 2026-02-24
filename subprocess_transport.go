@@ -431,6 +431,10 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 		env = append(env, "PWD="+t.options.Cwd)
 	}
 
+	// Log the full command for debugging
+	fmt.Fprintf(os.Stderr, "[claude-sdk] launching: %s\n", strings.Join(cmdArgs, " "))
+	fmt.Fprintf(os.Stderr, "[claude-sdk] args count: %d\n", len(cmdArgs))
+
 	t.cmd = exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	setProcGroup(t.cmd)
 	t.cmd.Env = env
@@ -472,6 +476,7 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 		return NewCLIConnectionError("failed to start Claude Code", err)
 	}
 
+	fmt.Fprintf(os.Stderr, "[claude-sdk] process started: pid=%d\n", t.cmd.Process.Pid)
 	t.ready = true
 	return nil
 }
