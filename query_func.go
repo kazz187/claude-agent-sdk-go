@@ -53,14 +53,14 @@ func RunQuery(ctx context.Context, prompt string, options *ClaudeAgentOptions) (
 		// Extract SDK MCP servers
 		sdkMcpServers := make(map[string]*SdkMcpServer)
 
-		// Calculate initialize timeout
+		// Calculate initialize timeout.
+		// This is separate from CLAUDE_CODE_STREAM_CLOSE_TIMEOUT which controls
+		// how long stdin stays open for the control protocol. The initialize
+		// timeout only covers the CLI startup handshake and should remain short.
 		initTimeout := 60 * time.Second
-		if timeoutStr := os.Getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"); timeoutStr != "" {
+		if timeoutStr := os.Getenv("CLAUDE_CODE_INIT_TIMEOUT"); timeoutStr != "" {
 			if ms, err := strconv.ParseInt(timeoutStr, 10, 64); err == nil {
-				t := time.Duration(ms) * time.Millisecond
-				if t > initTimeout {
-					initTimeout = t
-				}
+				initTimeout = time.Duration(ms) * time.Millisecond
 			}
 		}
 
