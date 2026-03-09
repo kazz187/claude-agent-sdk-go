@@ -179,8 +179,10 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 
 	cmd := []string{cliPath, "--output-format", "stream-json", "--verbose"}
 
-	// System prompt
-	if t.options.SystemPrompt == nil {
+	// Agent or system prompt (--agent takes precedence)
+	if t.options.Agent != "" {
+		cmd = append(cmd, "--agent", t.options.Agent)
+	} else if t.options.SystemPrompt == nil {
 		cmd = append(cmd, "--system-prompt", "")
 	} else if sp, ok := t.options.SystemPrompt.(string); ok {
 		cmd = append(cmd, "--system-prompt", sp)

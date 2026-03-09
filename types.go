@@ -524,6 +524,9 @@ type ClaudeAgentOptions struct {
 	// Worktree creates a new git worktree for this session.
 	// If non-nil, --worktree is passed. Empty string means auto-named worktree.
 	Worktree *string `json:"-"`
+	// Agent specifies the agent for the current session (maps to --agent CLI flag).
+	// When set, SystemPrompt is ignored and --system-prompt is not passed.
+	Agent string `json:"agent,omitempty"`
 }
 
 // ToolAnnotations represents annotations for an MCP tool.
