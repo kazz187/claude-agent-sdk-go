@@ -45,6 +45,7 @@ type SubprocessTransport struct {
 	ready         bool
 	exitError     error
 	maxBufferSize int
+	cmdArgs       []string
 
 	mu     sync.Mutex
 	closed bool
@@ -64,6 +65,17 @@ func NewSubprocessTransport(prompt string, options ClaudeAgentOptions) *Subproce
 		prompt:        prompt,
 		maxBufferSize: maxBufferSize,
 	}
+}
+
+// CommandArgs returns the CLI command arguments used to launch the subprocess.
+// Returns nil if Connect has not been called yet.
+func (t *SubprocessTransport) CommandArgs() []string {
+	if t.cmdArgs == nil {
+		return nil
+	}
+	args := make([]string, len(t.cmdArgs))
+	copy(args, t.cmdArgs)
+	return args
 }
 
 // findCLI locates the Claude Code CLI binary.
@@ -440,9 +452,9 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 		env = append(env, "PWD="+t.options.Cwd)
 	}
 
-	// Log the full command for debugging
-	fmt.Fprintf(os.Stderr, "[claude-sdk] launching: %s\n", strings.Join(cmdArgs, " "))
-	fmt.Fprintf(os.Stderr, "[claude-sdk] args count: %d\n", len(cmdArgs))
+	// Store command args for retrieval by library consumers
+	t.cmdArgs = make([]string, len(cmdArgs))
+	copy(t.cmdArgs, cmdArgs)
 
 	t.cmd = exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	setProcGroup(t.cmd)
@@ -485,7 +497,6 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 		return NewCLIConnectionError("failed to start Claude Code", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[claude-sdk] process started: pid=%d\n", t.cmd.Process.Pid)
 	t.ready = true
 	return nil
 }
