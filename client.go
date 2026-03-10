@@ -408,3 +408,15 @@ func (c *ClaudeSDKClient) ReceiveResponse(ctx context.Context) ([]Message, error
 		}
 	}
 }
+
+// CommandArgs returns the CLI command arguments used to launch the subprocess.
+// Returns nil if the transport is not a SubprocessTransport or Connect has not been called.
+func (c *ClaudeSDKClient) CommandArgs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if st, ok := c.transport.(*SubprocessTransport); ok {
+		return st.CommandArgs()
+	}
+	return nil
+}
