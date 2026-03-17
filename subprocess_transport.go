@@ -641,10 +641,19 @@ func (t *SubprocessTransport) Close() error {
 		t.stdin = nil
 	}
 
-	// Close stderr
+	// Close stderr first so handleStderr goroutine exits.
 	if t.stderr != nil {
 		t.stderr.Close()
 		t.stderr = nil
+	}
+
+	// Close stdout BEFORE killing the process. This immediately unblocks
+	// any goroutine blocked on scanner.Scan() reading from the pipe
+	// (e.g. the ReadMessages goroutine). Without this, the pipe stays
+	// open if child processes inherited it, causing cmd.Wait() to hang.
+	if t.stdout != nil {
+		t.stdout.Close()
+		t.stdout = nil
 	}
 
 	// Terminate entire process group (including grandchildren spawned by Claude's Task tool)
@@ -660,12 +669,6 @@ func (t *SubprocessTransport) Close() error {
 			forceKillProcessGroup(t.cmd.Process.Pid)
 			<-done
 		}
-	}
-
-	// Close stdout
-	if t.stdout != nil {
-		t.stdout.Close()
-		t.stdout = nil
 	}
 
 	return nil
