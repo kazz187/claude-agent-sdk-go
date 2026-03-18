@@ -24,6 +24,24 @@ const (
 	sdkVersion               = "0.1.0"
 )
 
+var sdkDebugOnce sync.Once
+var sdkDebugFile *os.File
+
+func sdkDebugLog(format string, args ...any) {
+	sdkDebugOnce.Do(func() {
+		f, _ := os.OpenFile("/tmp/sdk-close-debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		sdkDebugFile = f
+	})
+	if sdkDebugFile != nil {
+		fmt.Fprintf(sdkDebugFile, "%s ", time.Now().Format("15:04:05.000"))
+		fmt.Fprintf(sdkDebugFile, format, args...)
+		if len(format) > 0 && format[len(format)-1] != '\n' {
+			fmt.Fprintln(sdkDebugFile)
+		}
+		sdkDebugFile.Sync()
+	}
+}
+
 // cmdLengthLimit is platform-specific command line length limit.
 var cmdLengthLimit = func() int {
 	if runtime.GOOS == "windows" {
@@ -626,10 +644,13 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) (<-chan json.Raw
 
 // Close closes the transport and cleans up resources.
 func (t *SubprocessTransport) Close() error {
+	sdkDebugLog("[SDK] Close: acquiring mutex\n")
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	sdkDebugLog("[SDK] Close: mutex acquired\n")
 
 	if t.closed {
+		sdkDebugLog("[SDK] Close: already closed\n")
 		return nil
 	}
 	t.closed = true
@@ -652,25 +673,36 @@ func (t *SubprocessTransport) Close() error {
 	// (e.g. the ReadMessages goroutine). Without this, the pipe stays
 	// open if child processes inherited it, causing cmd.Wait() to hang.
 	if t.stdout != nil {
+		sdkDebugLog("[SDK] Close: closing stdout\n")
 		t.stdout.Close()
 		t.stdout = nil
 	}
 
 	// Terminate entire process group (including grandchildren spawned by Claude's Task tool)
 	if t.cmd != nil && t.cmd.Process != nil {
-		killProcessGroup(t.cmd.Process.Pid)
+		pid := t.cmd.Process.Pid
+		sdkDebugLog("[SDK] Close: killing process group pid=%d\n", pid)
+		killProcessGroup(pid)
 
 		// Wait with timeout — SIGKILL fallback
 		done := make(chan error, 1)
-		go func() { done <- t.cmd.Wait() }()
+		go func() {
+			sdkDebugLog("[SDK] Close: calling cmd.Wait() pid=%d\n", pid)
+			err := t.cmd.Wait()
+			sdkDebugLog("[SDK] Close: cmd.Wait() returned pid=%d err=%v\n", pid, err)
+			done <- err
+		}()
 		select {
 		case <-done:
+			sdkDebugLog("[SDK] Close: wait done pid=%d\n", pid)
 		case <-time.After(10 * time.Second):
-			forceKillProcessGroup(t.cmd.Process.Pid)
+			sdkDebugLog("[SDK] Close: 10s timeout, force killing pid=%d\n", pid)
+			forceKillProcessGroup(pid)
 			<-done
 		}
 	}
 
+	sdkDebugLog("[SDK] Close: complete\n")
 	return nil
 }
 
