@@ -47,6 +47,7 @@ const (
 	ContentBlockTypeThinking   ContentBlockType = "thinking"
 	ContentBlockTypeToolUse    ContentBlockType = "tool_use"
 	ContentBlockTypeToolResult ContentBlockType = "tool_result"
+	ContentBlockTypeImage      ContentBlockType = "image"
 )
 
 // ControlSubtype represents the subtype field of control protocol messages.

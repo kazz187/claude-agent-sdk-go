@@ -1016,3 +1016,158 @@ func TestHandleSdkMcpRequest_ServerNotFound(t *testing.T) {
 		t.Error("expected error for nonexistent server")
 	}
 }
+
+func TestParseMessage_AssistantMessage_ImageBlock(t *testing.T) {
+	data := mustMarshal(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"model": "claude-3-opus",
+			"content": []any{
+				map[string]any{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "image/png",
+						"data":       "iVBORw0KGgo=",
+					},
+				},
+			},
+		},
+	})
+
+	msg, err := ParseMessage(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assistantMsg, ok := msg.(*AssistantMessage)
+	if !ok {
+		t.Fatalf("expected *AssistantMessage, got %T", msg)
+	}
+
+	if len(assistantMsg.Content) != 1 {
+		t.Fatalf("expected 1 content block, got %d", len(assistantMsg.Content))
+	}
+
+	imgBlock, ok := assistantMsg.Content[0].(ImageBlock)
+	if !ok {
+		t.Fatalf("expected ImageBlock, got %T", assistantMsg.Content[0])
+	}
+
+	if imgBlock.Source.Type != "base64" {
+		t.Errorf("expected source type 'base64', got '%s'", imgBlock.Source.Type)
+	}
+	if imgBlock.Source.MediaType != "image/png" {
+		t.Errorf("expected media_type 'image/png', got '%s'", imgBlock.Source.MediaType)
+	}
+	if imgBlock.Source.Data != "iVBORw0KGgo=" {
+		t.Errorf("expected data 'iVBORw0KGgo=', got '%s'", imgBlock.Source.Data)
+	}
+}
+
+func TestParseMessage_MixedTextAndImageBlocks(t *testing.T) {
+	data := mustMarshal(map[string]any{
+		"type": "user",
+		"message": map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "text",
+					"text": "Please analyze this image:",
+				},
+				map[string]any{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "image/jpeg",
+						"data":       "AAAA",
+					},
+				},
+				map[string]any{
+					"type": "text",
+					"text": "What do you see?",
+				},
+			},
+		},
+	})
+
+	msg, err := ParseMessage(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	userMsg, ok := msg.(*UserMessage)
+	if !ok {
+		t.Fatalf("expected *UserMessage, got %T", msg)
+	}
+
+	blocks := userMsg.GetContentBlocks()
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 content blocks, got %d", len(blocks))
+	}
+
+	// First block: text
+	textBlock, ok := blocks[0].(TextBlock)
+	if !ok {
+		t.Fatalf("expected TextBlock at index 0, got %T", blocks[0])
+	}
+	if textBlock.Text != "Please analyze this image:" {
+		t.Errorf("unexpected text: %s", textBlock.Text)
+	}
+
+	// Second block: image
+	imgBlock, ok := blocks[1].(ImageBlock)
+	if !ok {
+		t.Fatalf("expected ImageBlock at index 1, got %T", blocks[1])
+	}
+	if imgBlock.Source.MediaType != "image/jpeg" {
+		t.Errorf("expected media_type 'image/jpeg', got '%s'", imgBlock.Source.MediaType)
+	}
+
+	// Third block: text
+	textBlock2, ok := blocks[2].(TextBlock)
+	if !ok {
+		t.Fatalf("expected TextBlock at index 2, got %T", blocks[2])
+	}
+	if textBlock2.Text != "What do you see?" {
+		t.Errorf("unexpected text: %s", textBlock2.Text)
+	}
+}
+
+func TestImageBlock_MarshalJSON(t *testing.T) {
+	block := ImageBlock{
+		Source: ImageSource{
+			Type:      "base64",
+			MediaType: "image/png",
+			Data:      "AAAA",
+		},
+	}
+
+	data, err := json.Marshal(block)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("unexpected error unmarshaling: %v", err)
+	}
+
+	if result["type"] != "image" {
+		t.Errorf("expected type 'image', got '%v'", result["type"])
+	}
+
+	source, ok := result["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected source to be map, got %T", result["source"])
+	}
+	if source["type"] != "base64" {
+		t.Errorf("expected source type 'base64', got '%v'", source["type"])
+	}
+	if source["media_type"] != "image/png" {
+		t.Errorf("expected media_type 'image/png', got '%v'", source["media_type"])
+	}
+	if source["data"] != "AAAA" {
+		t.Errorf("expected data 'AAAA', got '%v'", source["data"])
+	}
+}

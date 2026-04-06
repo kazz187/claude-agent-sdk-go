@@ -51,6 +51,7 @@ type contentBlockWire struct {
 	ToolUseID string           `json:"tool_use_id,omitempty"`
 	Content   any              `json:"content,omitempty"`
 	IsError   *bool            `json:"is_error,omitempty"`
+	Source    *ImageSource     `json:"source,omitempty"`
 }
 
 // ParseMessage parses a raw JSON message from CLI output into a typed Message.
@@ -237,6 +238,10 @@ func parseContentBlocksFromRaw(data json.RawMessage) ([]ContentBlock, error) {
 				Content:   b.Content,
 				IsError:   b.IsError,
 			})
+		case ContentBlockTypeImage:
+			if b.Source != nil {
+				result = append(result, ImageBlock{Source: *b.Source})
+			}
 		}
 	}
 	return result, nil

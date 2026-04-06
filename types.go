@@ -362,6 +362,29 @@ type ToolResultBlock struct {
 
 func (ToolResultBlock) isContentBlock() {}
 
+// ImageSource represents the source of an image content block.
+type ImageSource struct {
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // e.g. "image/png", "image/jpeg", "image/gif", "image/webp"
+	Data      string `json:"data"`       // base64-encoded image data
+}
+
+// ImageBlock represents an image content block.
+type ImageBlock struct {
+	Source ImageSource `json:"source"`
+}
+
+func (ImageBlock) isContentBlock() {}
+
+// MarshalJSON implements json.Marshaler for ImageBlock so the "type" field is included.
+func (b ImageBlock) MarshalJSON() ([]byte, error) {
+	type imageBlockJSON struct {
+		Type   string      `json:"type"`
+		Source ImageSource `json:"source"`
+	}
+	return json.Marshal(imageBlockJSON{Type: string(ContentBlockTypeImage), Source: b.Source})
+}
+
 // Message represents a message in the conversation.
 type Message interface {
 	isMessage()
