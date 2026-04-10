@@ -17,6 +17,8 @@ const (
 	PermissionModeAcceptEdits       PermissionMode = "acceptEdits"
 	PermissionModePlan              PermissionMode = "plan"
 	PermissionModeBypassPermissions PermissionMode = "bypassPermissions"
+	PermissionModeAuto              PermissionMode = "auto"
+	PermissionModeDontAsk           PermissionMode = "dontAsk"
 )
 
 // SdkBeta represents SDK beta feature flags.
@@ -74,14 +76,66 @@ type SystemPromptPreset struct {
 	Type   string `json:"type"`   // "preset"
 	Preset string `json:"preset"` // "claude_code"
 	Append string `json:"append,omitempty"`
+	// ExcludeDynamicSections strips per-user dynamic sections (cwd, memory, git
+	// status) from the system prompt so it stays cacheable across users.
+	ExcludeDynamicSections bool `json:"exclude_dynamic_sections,omitempty"`
+}
+
+// SystemPromptFile represents a file-based system prompt configuration.
+type SystemPromptFile struct {
+	Type string `json:"type"` // "file"
+	Path string `json:"path"`
+}
+
+// TaskBudget represents a task budget configuration.
+type TaskBudget struct {
+	Total int `json:"total"`
+}
+
+// SDKSessionInfo contains session metadata returned by ListSessions / GetSessionInfo.
+// Extracted from stat + head/tail reads without full JSONL parsing.
+type SDKSessionInfo struct {
+	SessionID    string `json:"session_id"`
+	Summary      string `json:"summary"`
+	LastModified int64  `json:"last_modified"` // milliseconds since epoch
+	FileSize     *int64 `json:"file_size,omitempty"`
+	CustomTitle  string `json:"custom_title,omitempty"`
+	FirstPrompt  string `json:"first_prompt,omitempty"`
+	GitBranch    string `json:"git_branch,omitempty"`
+	Cwd          string `json:"cwd,omitempty"`
+	Tag          string `json:"tag,omitempty"`
+	CreatedAt    *int64 `json:"created_at,omitempty"` // milliseconds since epoch
+}
+
+// SessionMessage is a user or assistant message from a session transcript,
+// returned by GetSessionMessages.
+type SessionMessage struct {
+	Type      string         `json:"type"` // "user" or "assistant"
+	UUID      string         `json:"uuid"`
+	SessionID string         `json:"session_id"`
+	Message   map[string]any `json:"message"`
+}
+
+// ForkSessionResult is the result of a ForkSession operation.
+type ForkSessionResult struct {
+	SessionID string `json:"session_id"`
 }
 
 // AgentDefinition represents an agent definition configuration.
 type AgentDefinition struct {
-	Description string   `json:"description"`
-	Prompt      string   `json:"prompt"`
-	Tools       []string `json:"tools,omitempty"`
-	Model       string   `json:"model,omitempty"` // "sonnet", "opus", "haiku", "inherit"
+	Description     string         `json:"description"`
+	Prompt          string         `json:"prompt"`
+	Tools           []string       `json:"tools,omitempty"`
+	DisallowedTools []string       `json:"disallowedTools,omitempty"`
+	Model           string         `json:"model,omitempty"`
+	Skills          []string       `json:"skills,omitempty"`
+	Memory          string         `json:"memory,omitempty"` // "user", "project", "local"
+	McpServers      []any          `json:"mcpServers,omitempty"`
+	InitialPrompt   string         `json:"initialPrompt,omitempty"`
+	MaxTurns        *int           `json:"maxTurns,omitempty"`
+	Background      *bool          `json:"background,omitempty"`
+	Effort          any            `json:"effort,omitempty"` // string or int
+	PermissionMode  PermissionMode `json:"permissionMode,omitempty"`
 }
 
 // PermissionUpdateDestination represents where permissions are updated.
@@ -173,6 +227,8 @@ func (p *PermissionUpdate) ToMap() map[string]any {
 type ToolPermissionContext struct {
 	Signal      context.Context     // For cancellation
 	Suggestions []*PermissionUpdate // Permission suggestions from CLI
+	ToolUseID   string              // Tool use ID in this assistant message
+	AgentID     string              // Sub-agent ID if running in a sub-agent
 }
 
 // PermissionResult represents the result of a permission check.
@@ -455,16 +511,21 @@ type Usage struct {
 }
 
 type ResultMessage struct {
-	Subtype          string          `json:"subtype"`
-	DurationMs       int             `json:"duration_ms"`
-	DurationAPIMs    int             `json:"duration_api_ms"`
-	IsError          bool            `json:"is_error"`
-	NumTurns         int             `json:"num_turns"`
-	SessionID        string          `json:"session_id"`
-	TotalCostUSD     *float64        `json:"total_cost_usd,omitempty"`
-	Usage            *Usage          `json:"usage,omitempty"`
-	Result           string          `json:"result,omitempty"`
-	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
+	Subtype           string          `json:"subtype"`
+	DurationMs        int             `json:"duration_ms"`
+	DurationAPIMs     int             `json:"duration_api_ms"`
+	IsError           bool            `json:"is_error"`
+	NumTurns          int             `json:"num_turns"`
+	SessionID         string          `json:"session_id"`
+	StopReason        string          `json:"stop_reason,omitempty"`
+	TotalCostUSD      *float64        `json:"total_cost_usd,omitempty"`
+	Usage             *Usage          `json:"usage,omitempty"`
+	Result            string          `json:"result,omitempty"`
+	StructuredOutput  json.RawMessage `json:"structured_output,omitempty"`
+	ModelUsage        map[string]any  `json:"modelUsage,omitempty"`
+	PermissionDenials []any           `json:"permission_denials,omitempty"`
+	Errors            []string        `json:"errors,omitempty"`
+	UUID              string          `json:"uuid,omitempty"`
 }
 
 func (ResultMessage) isMessage() {}
@@ -491,6 +552,80 @@ type StreamEvent struct {
 }
 
 func (StreamEvent) isMessage() {}
+
+// RateLimitInfo represents rate limit status emitted by the CLI.
+type RateLimitInfo struct {
+	Status                string         `json:"status"`
+	ResetsAt              *int64         `json:"resetsAt,omitempty"`
+	RateLimitType         string         `json:"rateLimitType,omitempty"`
+	Utilization           *float64       `json:"utilization,omitempty"`
+	OverageStatus         string         `json:"overageStatus,omitempty"`
+	OverageResetsAt       *int64         `json:"overageResetsAt,omitempty"`
+	OverageDisabledReason string         `json:"overageDisabledReason,omitempty"`
+	Raw                   map[string]any `json:"-"`
+}
+
+// RateLimitEvent represents a rate limit event emitted by the CLI.
+type RateLimitEvent struct {
+	RateLimitInfo RateLimitInfo `json:"rate_limit_info"`
+	UUID          string        `json:"uuid"`
+	SessionID     string        `json:"session_id"`
+}
+
+func (RateLimitEvent) isMessage() {}
+
+// TaskUsage represents usage statistics in task_progress / task_notification messages.
+type TaskUsage struct {
+	TotalTokens int `json:"total_tokens"`
+	ToolUses    int `json:"tool_uses"`
+	DurationMs  int `json:"duration_ms"`
+}
+
+// TaskStartedMessage is emitted when a task starts.
+// Embeds SystemMessage so existing SystemMessage consumers keep working.
+type TaskStartedMessage struct {
+	SystemMessage
+	TaskID      string `json:"task_id"`
+	Description string `json:"description"`
+	UUID        string `json:"uuid"`
+	SessionID   string `json:"session_id"`
+	ToolUseID   string `json:"tool_use_id,omitempty"`
+	TaskType    string `json:"task_type,omitempty"`
+}
+
+// TaskProgressMessage is emitted while a task is in progress.
+type TaskProgressMessage struct {
+	SystemMessage
+	TaskID       string    `json:"task_id"`
+	Description  string    `json:"description"`
+	Usage        TaskUsage `json:"usage"`
+	UUID         string    `json:"uuid"`
+	SessionID    string    `json:"session_id"`
+	ToolUseID    string    `json:"tool_use_id,omitempty"`
+	LastToolName string    `json:"last_tool_name,omitempty"`
+}
+
+// TaskNotificationStatus represents the status of a task_notification message.
+type TaskNotificationStatus string
+
+const (
+	TaskNotificationCompleted TaskNotificationStatus = "completed"
+	TaskNotificationFailed    TaskNotificationStatus = "failed"
+	TaskNotificationStopped   TaskNotificationStatus = "stopped"
+)
+
+// TaskNotificationMessage is emitted when a task completes, fails, or is stopped.
+type TaskNotificationMessage struct {
+	SystemMessage
+	TaskID     string                 `json:"task_id"`
+	Status     TaskNotificationStatus `json:"status"`
+	OutputFile string                 `json:"output_file"`
+	Summary    string                 `json:"summary"`
+	UUID       string                 `json:"uuid"`
+	SessionID  string                 `json:"session_id"`
+	ToolUseID  string                 `json:"tool_use_id,omitempty"`
+	Usage      *TaskUsage             `json:"usage,omitempty"`
+}
 
 // OutputFormat represents the output format configuration for Claude.
 type OutputFormat struct {
@@ -550,6 +685,10 @@ type ClaudeAgentOptions struct {
 	// Agent specifies the agent for the current session (maps to --agent CLI flag).
 	// When set, SystemPrompt is ignored and --system-prompt is not passed.
 	Agent string `json:"agent,omitempty"`
+	// SessionID specifies a custom session ID (maps to --session-id CLI flag).
+	SessionID string `json:"session_id,omitempty"`
+	// TaskBudget specifies the API-side task budget in tokens.
+	TaskBudget *TaskBudget `json:"task_budget,omitempty"`
 }
 
 // ToolAnnotations represents annotations for an MCP tool.
@@ -558,6 +697,10 @@ type ToolAnnotations struct {
 	DestructiveHint *bool `json:"destructiveHint,omitempty"`
 	IdempotentHint  *bool `json:"idempotentHint,omitempty"`
 	OpenWorldHint   *bool `json:"openWorldHint,omitempty"`
+	// MaxResultSizeChars caps the layer-2 tool-result spill threshold on the
+	// CLI side. Forwarded via _meta (key "anthropic/maxResultSizeChars") to
+	// bypass Zod annotation stripping.
+	MaxResultSizeChars *int `json:"-"`
 }
 
 // hasValue reports whether at least one annotation hint is set.
@@ -664,6 +807,8 @@ type canUseToolRequest struct {
 	ToolName              string              `json:"tool_name"`
 	Input                 map[string]any      `json:"input"`
 	PermissionSuggestions []*PermissionUpdate `json:"permission_suggestions,omitempty"`
+	ToolUseID             string              `json:"tool_use_id,omitempty"`
+	AgentID               string              `json:"agent_id,omitempty"`
 }
 
 type hookCallbackRequest struct {
@@ -720,12 +865,14 @@ type mcpToolInfo struct {
 	Description string           `json:"description,omitempty"`
 	InputSchema any              `json:"inputSchema"`
 	Annotations *ToolAnnotations `json:"annotations,omitempty"`
+	Meta        map[string]any   `json:"_meta,omitempty"`
 }
 
-// MCP tools/call result.
+// MCP tools/call result. Note: MCP wire format uses "isError" (camelCase)
+// but existing CLI has accepted "is_error"; emit both for compatibility.
 type mcpToolCallResult struct {
 	Content []map[string]any `json:"content"`
-	IsError bool             `json:"is_error,omitempty"`
+	IsError bool             `json:"isError,omitempty"`
 }
 
 type jsonrpcRequest struct {
@@ -790,6 +937,26 @@ type mcpStatusRequest struct {
 type rewindFilesRequest struct {
 	Subtype       ControlSubtype `json:"subtype"`
 	UserMessageID string         `json:"user_message_id"`
+}
+
+type contextUsageRequest struct {
+	Subtype ControlSubtype `json:"subtype"`
+}
+
+type mcpReconnectRequest struct {
+	Subtype    ControlSubtype `json:"subtype"`
+	ServerName string         `json:"serverName"`
+}
+
+type mcpToggleRequest struct {
+	Subtype    ControlSubtype `json:"subtype"`
+	ServerName string         `json:"serverName"`
+	Enabled    bool           `json:"enabled"`
+}
+
+type stopTaskRequest struct {
+	Subtype ControlSubtype `json:"subtype"`
+	TaskID  string         `json:"task_id"`
 }
 
 // --- MCP config for CLI flags ---

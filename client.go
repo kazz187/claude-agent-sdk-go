@@ -333,6 +333,58 @@ func (c *ClaudeSDKClient) GetMcpStatus(ctx context.Context) (json.RawMessage, er
 	return query.GetMcpStatus()
 }
 
+// GetContextUsage gets a breakdown of current context window usage by category.
+func (c *ClaudeSDKClient) GetContextUsage(ctx context.Context) (json.RawMessage, error) {
+	c.mu.Lock()
+	query := c.query
+	c.mu.Unlock()
+
+	if query == nil {
+		return nil, ErrNotConnected
+	}
+
+	return query.GetContextUsage()
+}
+
+// ReconnectMcpServer reconnects a disconnected or failed MCP server.
+func (c *ClaudeSDKClient) ReconnectMcpServer(ctx context.Context, serverName string) error {
+	c.mu.Lock()
+	query := c.query
+	c.mu.Unlock()
+
+	if query == nil {
+		return ErrNotConnected
+	}
+
+	return query.ReconnectMcpServer(serverName)
+}
+
+// ToggleMcpServer enables or disables an MCP server.
+func (c *ClaudeSDKClient) ToggleMcpServer(ctx context.Context, serverName string, enabled bool) error {
+	c.mu.Lock()
+	query := c.query
+	c.mu.Unlock()
+
+	if query == nil {
+		return ErrNotConnected
+	}
+
+	return query.ToggleMcpServer(serverName, enabled)
+}
+
+// StopTask stops a running task by task ID.
+func (c *ClaudeSDKClient) StopTask(ctx context.Context, taskID string) error {
+	c.mu.Lock()
+	query := c.query
+	c.mu.Unlock()
+
+	if query == nil {
+		return ErrNotConnected
+	}
+
+	return query.StopTask(taskID)
+}
+
 // GetServerInfo returns server initialization info including available commands.
 func (c *ClaudeSDKClient) GetServerInfo() json.RawMessage {
 	c.mu.Lock()

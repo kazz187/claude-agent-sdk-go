@@ -81,11 +81,58 @@ func ParseMessage(data json.RawMessage) (Message, error) {
 		return parseResultMessage(data)
 	case MessageTypeStreamEvent:
 		return parseStreamEvent(data)
+	case MessageTypeRateLimitEvent:
+		return parseRateLimitEvent(data)
 	default:
 		// Forward-compatible: skip unrecognized message types so newer
 		// CLI versions don't crash older SDK versions.
 		return nil, nil
 	}
+}
+
+func parseRateLimitEvent(data json.RawMessage) (*RateLimitEvent, error) {
+	var wire struct {
+		RateLimitInfo map[string]any `json:"rate_limit_info"`
+		UUID          string         `json:"uuid"`
+		SessionID     string         `json:"session_id"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, NewMessageParseError("failed to parse rate_limit_event message", data)
+	}
+	if wire.RateLimitInfo == nil {
+		return nil, NewMessageParseError("rate_limit_event missing 'rate_limit_info' field", data)
+	}
+
+	info := RateLimitInfo{Raw: wire.RateLimitInfo}
+	if s, ok := wire.RateLimitInfo["status"].(string); ok {
+		info.Status = s
+	}
+	if v, ok := wire.RateLimitInfo["resetsAt"].(float64); ok {
+		n := int64(v)
+		info.ResetsAt = &n
+	}
+	if s, ok := wire.RateLimitInfo["rateLimitType"].(string); ok {
+		info.RateLimitType = s
+	}
+	if v, ok := wire.RateLimitInfo["utilization"].(float64); ok {
+		info.Utilization = &v
+	}
+	if s, ok := wire.RateLimitInfo["overageStatus"].(string); ok {
+		info.OverageStatus = s
+	}
+	if v, ok := wire.RateLimitInfo["overageResetsAt"].(float64); ok {
+		n := int64(v)
+		info.OverageResetsAt = &n
+	}
+	if s, ok := wire.RateLimitInfo["overageDisabledReason"].(string); ok {
+		info.OverageDisabledReason = s
+	}
+
+	return &RateLimitEvent{
+		RateLimitInfo: info,
+		UUID:          wire.UUID,
+		SessionID:     wire.SessionID,
+	}, nil
 }
 
 func parseUserMessage(data json.RawMessage) (*UserMessage, error) {
@@ -149,7 +196,7 @@ func parseAssistantMessage(data json.RawMessage) (*AssistantMessage, error) {
 	}, nil
 }
 
-func parseSystemMessage(data json.RawMessage) (*SystemMessage, error) {
+func parseSystemMessage(data json.RawMessage) (Message, error) {
 	var wire systemMessageWire
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return nil, NewMessageParseError("failed to parse system message", data)
@@ -165,10 +212,36 @@ func parseSystemMessage(data json.RawMessage) (*SystemMessage, error) {
 		return nil, NewMessageParseError("failed to parse system message data", data)
 	}
 
-	return &SystemMessage{
+	base := SystemMessage{
 		Subtype: wire.Subtype,
 		Data:    fullMap,
-	}, nil
+	}
+
+	switch wire.Subtype {
+	case "task_started":
+		msg := &TaskStartedMessage{SystemMessage: base}
+		if err := json.Unmarshal(data, msg); err != nil {
+			return nil, NewMessageParseError("failed to parse task_started message", data)
+		}
+		msg.SystemMessage = base
+		return msg, nil
+	case "task_progress":
+		msg := &TaskProgressMessage{SystemMessage: base}
+		if err := json.Unmarshal(data, msg); err != nil {
+			return nil, NewMessageParseError("failed to parse task_progress message", data)
+		}
+		msg.SystemMessage = base
+		return msg, nil
+	case "task_notification":
+		msg := &TaskNotificationMessage{SystemMessage: base}
+		if err := json.Unmarshal(data, msg); err != nil {
+			return nil, NewMessageParseError("failed to parse task_notification message", data)
+		}
+		msg.SystemMessage = base
+		return msg, nil
+	}
+
+	return &base, nil
 }
 
 func parseResultMessage(data json.RawMessage) (*ResultMessage, error) {

@@ -209,6 +209,23 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		if preset.Type == "preset" && preset.Append != "" {
 			cmd = append(cmd, "--append-system-prompt", preset.Append)
 		}
+		if preset.ExcludeDynamicSections {
+			cmd = append(cmd, "--exclude-dynamic-sections")
+		}
+	} else if file, ok := t.options.SystemPrompt.(*SystemPromptFile); ok {
+		if file.Path != "" {
+			cmd = append(cmd, "--system-prompt-file", file.Path)
+		}
+	}
+
+	// Session ID
+	if t.options.SessionID != "" {
+		cmd = append(cmd, "--session-id", t.options.SessionID)
+	}
+
+	// Task budget
+	if t.options.TaskBudget != nil {
+		cmd = append(cmd, "--task-budget", strconv.Itoa(t.options.TaskBudget.Total))
 	}
 
 	// Handle tools option (base set of tools)
@@ -336,15 +353,14 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 
 	// Agents are sent via initialize request, not CLI flag
 
-	// Setting sources
+	// Setting sources — omit flag entirely when empty (empty string causes CLI to
+	// misparse subsequent flags; see python SDK #778).
 	if len(t.options.SettingSources) > 0 {
 		sources := make([]string, len(t.options.SettingSources))
 		for i, s := range t.options.SettingSources {
 			sources[i] = string(s)
 		}
 		cmd = append(cmd, "--setting-sources", strings.Join(sources, ","))
-	} else {
-		cmd = append(cmd, "--setting-sources", "")
 	}
 
 	// Plugins
@@ -363,25 +379,20 @@ func (t *SubprocessTransport) buildCommand() ([]string, error) {
 		}
 	}
 
-	// Resolve thinking config → --max-thinking-tokens
-	// `Thinking` takes precedence over the deprecated `MaxThinkingTokens`
-	resolvedMaxThinkingTokens := t.options.MaxThinkingTokens
+	// Resolve thinking config → --thinking / --max-thinking-tokens
+	// `Thinking` takes precedence over the deprecated `MaxThinkingTokens`.
+	// Adaptive/Disabled use the `--thinking` flag; Enabled uses budget tokens.
 	if t.options.Thinking != nil {
 		switch tc := t.options.Thinking.(type) {
 		case ThinkingConfigAdaptive:
-			if resolvedMaxThinkingTokens == nil {
-				v := 32000
-				resolvedMaxThinkingTokens = &v
-			}
+			cmd = append(cmd, "--thinking", "adaptive")
 		case ThinkingConfigEnabled:
-			resolvedMaxThinkingTokens = &tc.BudgetTokens
+			cmd = append(cmd, "--max-thinking-tokens", strconv.Itoa(tc.BudgetTokens))
 		case ThinkingConfigDisabled:
-			v := 0
-			resolvedMaxThinkingTokens = &v
+			cmd = append(cmd, "--thinking", "disabled")
 		}
-	}
-	if resolvedMaxThinkingTokens != nil {
-		cmd = append(cmd, "--max-thinking-tokens", strconv.Itoa(*resolvedMaxThinkingTokens))
+	} else if t.options.MaxThinkingTokens != nil {
+		cmd = append(cmd, "--max-thinking-tokens", strconv.Itoa(*t.options.MaxThinkingTokens))
 	}
 
 	// Effort
@@ -436,12 +447,29 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 		return err
 	}
 
-	// Build environment
-	env := os.Environ()
+	// Build environment.
+	// - Filter out CLAUDECODE so SDK-spawned subprocesses don't think they're
+	//   running inside a Claude Code parent (python SDK #732 / #573).
+	// - CLAUDE_CODE_ENTRYPOINT defaults to "sdk-go" but is overridable by
+	//   the inherited env or options.Env (python SDK #686).
+	// - CLAUDE_AGENT_SDK_VERSION is always set by the SDK.
+	hasEntrypoint := false
+	env := make([]string, 0, len(os.Environ())+len(t.options.Env)+2)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "CLAUDECODE=") {
+			continue
+		}
+		if strings.HasPrefix(kv, "CLAUDE_CODE_ENTRYPOINT=") {
+			hasEntrypoint = true
+		}
+		env = append(env, kv)
+	}
+	if !hasEntrypoint {
+		env = append(env, "CLAUDE_CODE_ENTRYPOINT=sdk-go")
+	}
 	for k, v := range t.options.Env {
 		env = append(env, k+"="+v)
 	}
-	env = append(env, "CLAUDE_CODE_ENTRYPOINT=sdk-go")
 	env = append(env, "CLAUDE_AGENT_SDK_VERSION="+sdkVersion)
 
 	// Enable file checkpointing if requested
@@ -575,6 +603,12 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) (<-chan json.Raw
 
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
+				continue
+			}
+
+			// Skip non-JSON lines (e.g. [SandboxDebug]) when not mid-parse —
+			// otherwise they corrupt the buffer (python SDK #723 / #347).
+			if jsonBuffer.Len() == 0 && !strings.HasPrefix(line, "{") {
 				continue
 			}
 

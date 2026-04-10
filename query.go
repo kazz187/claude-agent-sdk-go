@@ -26,6 +26,7 @@ const (
 	MessageTypeSystem               MessageType = "system"
 	MessageTypeResult               MessageType = "result"
 	MessageTypeStreamEvent          MessageType = "stream_event"
+	MessageTypeRateLimitEvent       MessageType = "rate_limit_event"
 	MessageTypeControlResponse      MessageType = "control_response"
 	MessageTypeControlRequest       MessageType = "control_request"
 	MessageTypeControlCancelRequest MessageType = "control_cancel_request"
@@ -66,6 +67,10 @@ const (
 	ControlSubtypeSetModel          ControlSubtype = "set_model"
 	ControlSubtypeMcpStatus         ControlSubtype = "mcp_status"
 	ControlSubtypeRewindFiles       ControlSubtype = "rewind_files"
+	ControlSubtypeContextUsage      ControlSubtype = "get_context_usage"
+	ControlSubtypeMcpReconnect      ControlSubtype = "mcp_reconnect"
+	ControlSubtypeMcpToggle         ControlSubtype = "mcp_toggle"
+	ControlSubtypeStopTask          ControlSubtype = "stop_task"
 
 	// Control response subtypes
 	ControlSubtypeError   ControlSubtype = "error"
@@ -103,6 +108,10 @@ type Query struct {
 	hookCallbacks    map[string]HookCallback
 	nextCallbackID   int64
 	requestCounter   int64
+	// inflightRequests tracks cancel functions for control requests we are
+	// currently handling, keyed by the CLI-provided request_id. A
+	// control_cancel_request cancels these.
+	inflightRequests map[string]context.CancelFunc
 
 	// Message stream
 	messageChan chan json.RawMessage
@@ -163,6 +172,7 @@ func NewQuery(transport Transport, isStreamingMode bool, options QueryOptions) *
 		initializeTimeout:  initTimeout,
 		pendingResponses:   make(map[string]chan *controlResponsePayload),
 		hookCallbacks:      make(map[string]HookCallback),
+		inflightRequests:   make(map[string]context.CancelFunc),
 		messageChan:        make(chan json.RawMessage, 100),
 		errorChan:          make(chan error, 1),
 		firstResultChan:    make(chan struct{}),
@@ -230,7 +240,19 @@ func (q *Query) readMessages(ctx context.Context, msgChan <-chan json.RawMessage
 				// Handle control request in a separate goroutine to avoid blocking reader
 				go q.handleControlRequest(msg)
 			case MessageTypeControlCancelRequest:
-				// TODO: Implement cancellation support
+				var cancelWire struct {
+					RequestID string `json:"request_id"`
+				}
+				if err := json.Unmarshal(msg, &cancelWire); err == nil && cancelWire.RequestID != "" {
+					q.mu.Lock()
+					if cancel, ok := q.inflightRequests[cancelWire.RequestID]; ok {
+						delete(q.inflightRequests, cancelWire.RequestID)
+						q.mu.Unlock()
+						cancel()
+					} else {
+						q.mu.Unlock()
+					}
+				}
 			default:
 				// Track results for proper stream closure
 				if envelope.Type == MessageTypeResult {
@@ -313,18 +335,37 @@ func (q *Query) handleControlRequest(msg json.RawMessage) {
 		return
 	}
 
+	// Register a cancel function so the CLI can abandon this request via
+	// control_cancel_request. When cancelled, we skip sending a response —
+	// the CLI has already moved on.
+	reqCtx, cancel := context.WithCancel(q.ctx)
+	q.mu.Lock()
+	q.inflightRequests[wire.RequestID] = cancel
+	q.mu.Unlock()
+	defer func() {
+		q.mu.Lock()
+		delete(q.inflightRequests, wire.RequestID)
+		q.mu.Unlock()
+		cancel()
+	}()
+
 	var responseData any
 	var err error
 
 	switch envelope.Subtype {
 	case ControlSubtypeCanUseTool:
-		responseData, err = q.handleCanUseTool(wire.Request)
+		responseData, err = q.handleCanUseTool(reqCtx, wire.Request)
 	case ControlSubtypeHookCallback:
-		responseData, err = q.handleHookCallback(wire.Request)
+		responseData, err = q.handleHookCallback(reqCtx, wire.Request)
 	case ControlSubtypeMcpMessage:
 		responseData, err = q.handleMcpMessage(wire.Request)
 	default:
 		err = fmt.Errorf("unsupported control request subtype: %s", envelope.Subtype)
+	}
+
+	// If the CLI cancelled this request, skip sending a response.
+	if reqCtx.Err() != nil {
+		return
 	}
 
 	// Send response
@@ -355,7 +396,7 @@ func (q *Query) handleControlRequest(msg json.RawMessage) {
 }
 
 // handleCanUseTool handles tool permission requests.
-func (q *Query) handleCanUseTool(raw json.RawMessage) (any, error) {
+func (q *Query) handleCanUseTool(reqCtx context.Context, raw json.RawMessage) (any, error) {
 	if q.canUseTool == nil {
 		return nil, fmt.Errorf("canUseTool callback is not provided")
 	}
@@ -366,8 +407,10 @@ func (q *Query) handleCanUseTool(raw json.RawMessage) (any, error) {
 	}
 
 	ctx := ToolPermissionContext{
-		Signal:      q.ctx,
+		Signal:      reqCtx,
 		Suggestions: req.PermissionSuggestions,
+		ToolUseID:   req.ToolUseID,
+		AgentID:     req.AgentID,
 	}
 
 	result, err := q.canUseTool(req.ToolName, req.Input, ctx)
@@ -393,7 +436,7 @@ func (q *Query) handleCanUseTool(raw json.RawMessage) (any, error) {
 }
 
 // handleHookCallback handles hook callback requests.
-func (q *Query) handleHookCallback(raw json.RawMessage) (any, error) {
+func (q *Query) handleHookCallback(reqCtx context.Context, raw json.RawMessage) (any, error) {
 	var req hookCallbackRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal hook_callback request: %w", err)
@@ -408,7 +451,7 @@ func (q *Query) handleHookCallback(raw json.RawMessage) (any, error) {
 	}
 
 	ctx := HookContext{
-		Signal: q.ctx,
+		Signal: reqCtx,
 	}
 
 	output, err := callback(req.Input, req.ToolUseID, ctx)
@@ -473,8 +516,17 @@ func (q *Query) handleSdkMcpRequest(serverName string, req *jsonrpcRequest) *jso
 			if info.InputSchema == nil {
 				info.InputSchema = &jsonschema.Schema{}
 			}
-			if tool.Annotations != nil && tool.Annotations.hasValue() {
-				info.Annotations = tool.Annotations
+			if tool.Annotations != nil {
+				if tool.Annotations.hasValue() {
+					info.Annotations = tool.Annotations
+				}
+				// Forward maxResultSizeChars via _meta so it survives Zod
+				// annotation stripping on the CLI side.
+				if tool.Annotations.MaxResultSizeChars != nil {
+					info.Meta = map[string]any{
+						"anthropic/maxResultSizeChars": *tool.Annotations.MaxResultSizeChars,
+					}
+				}
 			}
 			toolsData[i] = info
 		}
@@ -668,6 +720,39 @@ func (q *Query) RewindFiles(userMessageID string) error {
 	_, err := q.sendControlRequest(rewindFilesRequest{
 		Subtype:       ControlSubtypeRewindFiles,
 		UserMessageID: userMessageID,
+	}, 60*time.Second)
+	return err
+}
+
+// GetContextUsage gets a breakdown of current context window usage by category.
+func (q *Query) GetContextUsage() (json.RawMessage, error) {
+	return q.sendControlRequest(contextUsageRequest{Subtype: ControlSubtypeContextUsage}, 60*time.Second)
+}
+
+// ReconnectMcpServer reconnects a disconnected or failed MCP server.
+func (q *Query) ReconnectMcpServer(serverName string) error {
+	_, err := q.sendControlRequest(mcpReconnectRequest{
+		Subtype:    ControlSubtypeMcpReconnect,
+		ServerName: serverName,
+	}, 60*time.Second)
+	return err
+}
+
+// ToggleMcpServer enables or disables an MCP server.
+func (q *Query) ToggleMcpServer(serverName string, enabled bool) error {
+	_, err := q.sendControlRequest(mcpToggleRequest{
+		Subtype:    ControlSubtypeMcpToggle,
+		ServerName: serverName,
+		Enabled:    enabled,
+	}, 60*time.Second)
+	return err
+}
+
+// StopTask stops a running task by task ID.
+func (q *Query) StopTask(taskID string) error {
+	_, err := q.sendControlRequest(stopTaskRequest{
+		Subtype: ControlSubtypeStopTask,
+		TaskID:  taskID,
 	}, 60*time.Second)
 	return err
 }
