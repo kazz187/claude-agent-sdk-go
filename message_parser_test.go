@@ -550,25 +550,40 @@ func TestBuildCommand_Betas(t *testing.T) {
 }
 
 func TestBuildCommand_Effort(t *testing.T) {
-	cliPath := createFakeCLI(t)
-	effort := "high"
-	transport := &SubprocessTransport{
-		options: ClaudeAgentOptions{
-			Effort:  &effort,
-			CLIPath: cliPath,
-		},
-		isStreaming:   true,
-		maxBufferSize: defaultMaxBufferSize,
+	cases := []struct {
+		name   string
+		effort string
+	}{
+		{"low", EffortLow},
+		{"medium", EffortMedium},
+		{"high", EffortHigh},
+		{"xhigh", EffortXHigh},
+		{"max", EffortMax},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cliPath := createFakeCLI(t)
+			effort := tc.effort
+			transport := &SubprocessTransport{
+				options: ClaudeAgentOptions{
+					Effort:  &effort,
+					CLIPath: cliPath,
+				},
+				isStreaming:   true,
+				maxBufferSize: defaultMaxBufferSize,
+			}
 
-	cmd, err := transport.buildCommand()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+			cmd, err := transport.buildCommand()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
-	cmdStr := strings.Join(cmd, " ")
-	if !strings.Contains(cmdStr, "--effort high") {
-		t.Errorf("expected --effort high in command, got: %s", cmdStr)
+			cmdStr := strings.Join(cmd, " ")
+			want := "--effort " + tc.effort
+			if !strings.Contains(cmdStr, want) {
+				t.Errorf("expected %q in command, got: %s", want, cmdStr)
+			}
+		})
 	}
 }
 

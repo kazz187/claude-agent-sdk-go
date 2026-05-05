@@ -123,20 +123,33 @@ type ForkSessionResult struct {
 
 // AgentDefinition represents an agent definition configuration.
 type AgentDefinition struct {
-	Description     string         `json:"description"`
-	Prompt          string         `json:"prompt"`
-	Tools           []string       `json:"tools,omitempty"`
-	DisallowedTools []string       `json:"disallowedTools,omitempty"`
-	Model           string         `json:"model,omitempty"`
-	Skills          []string       `json:"skills,omitempty"`
-	Memory          string         `json:"memory,omitempty"` // "user", "project", "local"
-	McpServers      []any          `json:"mcpServers,omitempty"`
-	InitialPrompt   string         `json:"initialPrompt,omitempty"`
-	MaxTurns        *int           `json:"maxTurns,omitempty"`
-	Background      *bool          `json:"background,omitempty"`
-	Effort          any            `json:"effort,omitempty"` // string or int
-	PermissionMode  PermissionMode `json:"permissionMode,omitempty"`
+	Description     string   `json:"description"`
+	Prompt          string   `json:"prompt"`
+	Tools           []string `json:"tools,omitempty"`
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
+	Model           string   `json:"model,omitempty"`
+	Skills          []string `json:"skills,omitempty"`
+	Memory          string   `json:"memory,omitempty"` // "user", "project", "local"
+	McpServers      []any    `json:"mcpServers,omitempty"`
+	InitialPrompt   string   `json:"initialPrompt,omitempty"`
+	MaxTurns        *int     `json:"maxTurns,omitempty"`
+	Background      *bool    `json:"background,omitempty"`
+	// Effort controls thinking depth. Valid string values: "low", "medium", "high", "xhigh", "max". Integer also accepted.
+	Effort         any            `json:"effort,omitempty"`
+	PermissionMode PermissionMode `json:"permissionMode,omitempty"`
 }
+
+// EffortLevel represents valid effort levels for the Effort option.
+// See https://docs.anthropic.com/en/docs/build-with-claude/effort.
+type EffortLevel = string
+
+const (
+	EffortLow    EffortLevel = "low"
+	EffortMedium EffortLevel = "medium"
+	EffortHigh   EffortLevel = "high"
+	EffortXHigh  EffortLevel = "xhigh"
+	EffortMax    EffortLevel = "max"
+)
 
 // PermissionUpdateDestination represents where permissions are updated.
 type PermissionUpdateDestination string
@@ -673,7 +686,7 @@ type ClaudeAgentOptions struct {
 	MaxThinkingTokens *int `json:"max_thinking_tokens,omitempty"`
 	// Thinking controls extended thinking behavior. Takes precedence over MaxThinkingTokens.
 	Thinking ThinkingConfig `json:"-"`
-	// Effort controls thinking depth. Valid values: "low", "medium", "high", "max".
+	// Effort controls thinking depth. Valid values: "low", "medium", "high", "xhigh", "max".
 	Effort       *string       `json:"-"`
 	OutputFormat *OutputFormat `json:"output_format,omitempty"`
 	// EnableFileCheckpointing enables file checkpointing to track file changes.
