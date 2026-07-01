@@ -121,21 +121,22 @@ func (t *SubprocessTransport) findCLI() (string, error) {
 	)
 }
 
-// buildSettingsValue builds the settings value, merging sandbox settings if provided.
+// buildSettingsValue builds the settings value, merging sandbox and ultracode settings if provided.
 func (t *SubprocessTransport) buildSettingsValue() (string, error) {
 	hasSettings := t.options.Settings != ""
 	hasSandbox := t.options.Sandbox != nil
+	hasUltracode := t.options.Ultracode
 
-	if !hasSettings && !hasSandbox {
+	if !hasSettings && !hasSandbox && !hasUltracode {
 		return "", nil
 	}
 
-	// If only settings path and no sandbox, pass through as-is
-	if hasSettings && !hasSandbox {
+	// If only settings path and nothing to merge, pass through as-is
+	if hasSettings && !hasSandbox && !hasUltracode {
 		return t.options.Settings, nil
 	}
 
-	// If we have sandbox settings, we need to merge into a JSON object
+	// If we have settings to merge, we need to build a JSON object
 	settingsObj := make(map[string]any)
 
 	if hasSettings {
@@ -167,6 +168,11 @@ func (t *SubprocessTransport) buildSettingsValue() (string, error) {
 	// Merge sandbox settings
 	if hasSandbox {
 		settingsObj["sandbox"] = t.options.Sandbox
+	}
+
+	// Merge ultracode flag (enables multi-agent Dynamic Workflow orchestration)
+	if hasUltracode {
+		settingsObj["ultracode"] = true
 	}
 
 	data, err := json.Marshal(settingsObj)

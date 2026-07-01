@@ -587,6 +587,118 @@ func TestBuildCommand_Effort(t *testing.T) {
 	}
 }
 
+func TestBuildCommand_Model(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+	}{
+		{"opus", ModelOpus},
+		{"sonnet", ModelSonnet},
+		{"haiku", ModelHaiku},
+		{"fable", ModelFable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cliPath := createFakeCLI(t)
+			transport := &SubprocessTransport{
+				options: ClaudeAgentOptions{
+					Model:   tc.model,
+					CLIPath: cliPath,
+				},
+				isStreaming:   true,
+				maxBufferSize: defaultMaxBufferSize,
+			}
+
+			cmd, err := transport.buildCommand()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			cmdStr := strings.Join(cmd, " ")
+			want := "--model " + tc.model
+			if !strings.Contains(cmdStr, want) {
+				t.Errorf("expected %q in command, got: %s", want, cmdStr)
+			}
+		})
+	}
+}
+
+func TestBuildCommand_Ultracode(t *testing.T) {
+	t.Run("enabled", func(t *testing.T) {
+		cliPath := createFakeCLI(t)
+		transport := &SubprocessTransport{
+			options: ClaudeAgentOptions{
+				Ultracode: true,
+				CLIPath:   cliPath,
+			},
+			isStreaming:   true,
+			maxBufferSize: defaultMaxBufferSize,
+		}
+
+		cmd, err := transport.buildCommand()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		cmdStr := strings.Join(cmd, " ")
+		if !strings.Contains(cmdStr, "--settings") {
+			t.Errorf("expected --settings flag in command, got: %s", cmdStr)
+		}
+		if !strings.Contains(cmdStr, `"ultracode":true`) {
+			t.Errorf(`expected "ultracode":true in settings, got: %s`, cmdStr)
+		}
+	})
+
+	t.Run("merged with existing settings", func(t *testing.T) {
+		cliPath := createFakeCLI(t)
+		transport := &SubprocessTransport{
+			options: ClaudeAgentOptions{
+				Ultracode: true,
+				Settings:  `{"foo":"bar"}`,
+				CLIPath:   cliPath,
+			},
+			isStreaming:   true,
+			maxBufferSize: defaultMaxBufferSize,
+		}
+
+		settingsValue, err := transport.buildSettingsValue()
+		if err != nil {
+			t.Fatalf("unexpected error building settings: %v", err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal([]byte(settingsValue), &got); err != nil {
+			t.Fatalf("settings value is not valid JSON (%q): %v", settingsValue, err)
+		}
+		if got["ultracode"] != true {
+			t.Errorf("expected ultracode=true, got: %v", got["ultracode"])
+		}
+		if got["foo"] != "bar" {
+			t.Errorf("expected existing setting foo=bar to be preserved, got: %v", got["foo"])
+		}
+	})
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cliPath := createFakeCLI(t)
+		transport := &SubprocessTransport{
+			options: ClaudeAgentOptions{
+				CLIPath: cliPath,
+			},
+			isStreaming:   true,
+			maxBufferSize: defaultMaxBufferSize,
+		}
+
+		cmd, err := transport.buildCommand()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		cmdStr := strings.Join(cmd, " ")
+		if strings.Contains(cmdStr, "--settings") {
+			t.Errorf("did not expect --settings flag when Ultracode is false and no other settings set, got: %s", cmdStr)
+		}
+	})
+}
+
 func TestBuildCommand_WorktreeWithName(t *testing.T) {
 	cliPath := createFakeCLI(t)
 	name := "my-feature"
