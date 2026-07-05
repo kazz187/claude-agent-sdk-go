@@ -151,6 +151,17 @@ const (
 	EffortMax    EffortLevel = "max"
 )
 
+// ModelAlias represents a Claude model alias accepted by the CLI's --model flag.
+// A full model ID (e.g. "claude-fable-5") may also be passed to the Model field.
+type ModelAlias = string
+
+const (
+	ModelOpus   ModelAlias = "opus"
+	ModelSonnet ModelAlias = "sonnet"
+	ModelHaiku  ModelAlias = "haiku"
+	ModelFable  ModelAlias = "fable"
+)
+
 // PermissionUpdateDestination represents where permissions are updated.
 type PermissionUpdateDestination string
 
@@ -687,7 +698,11 @@ type ClaudeAgentOptions struct {
 	// Thinking controls extended thinking behavior. Takes precedence over MaxThinkingTokens.
 	Thinking ThinkingConfig `json:"-"`
 	// Effort controls thinking depth. Valid values: "low", "medium", "high", "xhigh", "max".
-	Effort       *string       `json:"-"`
+	Effort *string `json:"-"`
+	// Ultracode enables multi-agent Dynamic Workflow orchestration.
+	// When true, {"ultracode": true} is merged into the JSON passed to --settings.
+	// Conceptually this is the tier above Effort; requires a CLI build that supports it.
+	Ultracode    bool          `json:"-"`
 	OutputFormat *OutputFormat `json:"output_format,omitempty"`
 	// EnableFileCheckpointing enables file checkpointing to track file changes.
 	// When enabled, files can be rewound to their state at any user message.
